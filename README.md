@@ -13,6 +13,7 @@
 - client 进程是数据面：维护长时间运行的 B 站 WebSocket 连接，并把解码后的原始命令转发回 API。
 - 这样拆分后，数据库账号和可选的 B 站 Cookie 都留在 API 侧。采集端部署到其他机器时只需要 `API_BASE_URL` 和 `COLLECTOR_CLIENT_ID`。
 - B 站同时存在“配置房间号”和“真实房间号”。管理页输入的是配置房间号，API 会保存 B 站返回的真实房间号，并用真实房间号做 WebSocket 采集。
+- 直播场次记录在 `live_sessions` 表。API 轮询到 `live_status == 1` 时，用 B 站房间信息里的 `live_time` 作为 `started_at` 创建或恢复当前场次；轮询到下播时写入 `ended_at`。`monitor_runs` 只表示采集连接运行，不等同于直播场次。
 - 采集端把原始命令提交到 `/internal/events/batch`。事件解析集中在 API 侧，后续调整解析规则时不需要重新部署每个采集端。
 - 当前入库的业务事件包括 `danmaku`、`enter_room`、`gift`、`guard`、`super_chat`。删除醒目留言、互动提示、点赞提示、购物车、排名变化、连麦状态、礼物连击和其他高频展示噪声命令会被主动忽略。
 - `BILI_SESSDATA` 是可选项。普通直播间可能匿名也能访问，但如果 B 站对房间信息或 WebSocket 配置加强校验，配置 Cookie 会更稳。
@@ -43,7 +44,7 @@ uv run python -m blivedm_client.main
 3. client 从 `/internal/collector/tasks` 拉取任务。
 4. client 连接 B 站弹幕 WebSocket，并解码消息。
 5. client 把原始命令提交到 `/internal/events/batch`。
-6. API 解析事件并写入 MySQL。
+6. API 解析事件并写入 MySQL，事件会关联当前 `live_session_id`。
 
 ## 时序图
 
@@ -66,11 +67,13 @@ sequenceDiagram
     loop 定时轮询或被唤醒
         API->>DB: 读取已启用直播间
         API->>BiliHTTP: 查询房间信息和直播状态
-        BiliHTTP-->>API: 返回真实房间号、标题、主播 UID、直播状态
+        BiliHTTP-->>API: 返回真实房间号、标题、主播 UID、直播状态、开播时间
         API->>DB: 更新 rooms 状态
         alt 房间未开播
+            API->>DB: 结束 live_sessions 当前场次
             API->>DB: 关闭该房间运行中的 monitor_runs
         else 房间正在直播
+            API->>DB: 创建或恢复 live_sessions 当前场次
             API->>DB: 保留可被认领的直播房间状态
         end
     end
@@ -90,7 +93,7 @@ sequenceDiagram
         Client->>Client: 通过 blivedm 解码和解压
         Client->>API: POST /internal/events/batch
         API->>API: 解析 danmaku、enter_room、gift 等业务事件
-        API->>DB: 写入 room_events，按 event_key 去重
+        API->>DB: 写入 room_events 并关联 live_session_id，按 event_key 去重
     end
 
     par 采集心跳

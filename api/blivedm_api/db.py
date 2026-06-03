@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS rooms (
     anchor_uid BIGINT NULL,
     enabled TINYINT(1) NOT NULL DEFAULT 1,
     live_status TINYINT NOT NULL DEFAULT 0,
+    current_session_id BIGINT NULL,
     remark VARCHAR(255) NOT NULL DEFAULT '',
     last_live_at DATETIME NULL,
     last_checked_at DATETIME NULL,
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS room_events (
     room_id BIGINT NOT NULL,
     event_type VARCHAR(50) NOT NULL,
     event_key VARCHAR(191) NULL,
+    live_session_id BIGINT NULL,
     uid BIGINT NULL,
     username VARCHAR(255) NOT NULL DEFAULT '',
     content TEXT NULL,
@@ -45,8 +47,30 @@ CREATE TABLE IF NOT EXISTS room_events (
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uniq_room_event_key (room_id, event_type, event_key),
+    KEY idx_room_events_session_created (live_session_id, created_at),
     KEY idx_room_events_room_created (room_id, created_at),
     KEY idx_room_events_type_created (event_type, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_LIVE_SESSIONS_SQL = """
+CREATE TABLE IF NOT EXISTS live_sessions (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    room_title VARCHAR(255) NOT NULL DEFAULT '',
+    started_at DATETIME NOT NULL,
+    detected_started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at DATETIME NULL,
+    detected_ended_at DATETIME NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'live',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_live_sessions_room_started (room_id, started_at),
+    KEY idx_live_sessions_configured_started (configured_room_id, started_at),
+    KEY idx_live_sessions_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -113,8 +137,12 @@ class Database:
 
     async def migrate(self) -> None:
         await self.execute(CREATE_ROOMS_SQL)
+        await self.execute(CREATE_LIVE_SESSIONS_SQL)
         await self.execute(CREATE_ROOM_EVENTS_SQL)
         await self.execute(CREATE_MONITOR_RUNS_SQL)
+        await self.ensure_column("rooms", "current_session_id", "BIGINT NULL AFTER live_status")
+        await self.ensure_column("room_events", "live_session_id", "BIGINT NULL AFTER event_key")
+        await self.ensure_index("room_events", "idx_room_events_session_created", "KEY idx_room_events_session_created (live_session_id, created_at)")
         await self.ensure_column("monitor_runs", "configured_room_id", "BIGINT NULL AFTER room_id")
         await self.ensure_column("monitor_runs", "client_id", "VARCHAR(128) NULL AFTER configured_room_id")
         await self.ensure_column("monitor_runs", "last_heartbeat_at", "DATETIME NULL AFTER started_at")
@@ -235,6 +263,21 @@ class Database:
             return
         await self.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
+    async def ensure_index(self, table_name: str, index_name: str, ddl: str) -> None:
+        row = await self.fetch_one(
+            """
+            SELECT COUNT(*) AS count
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+              AND INDEX_NAME = %s
+            """,
+            (self._settings.mysql_database, table_name, index_name),
+        )
+        if row and int(row["count"]) > 0:
+            return
+        await self.execute(f"ALTER TABLE {table_name} ADD {ddl}")
+
     async def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> int:
         if self._pool is None:
             raise RuntimeError("database is not connected")
@@ -283,9 +326,16 @@ class Database:
         return await self.fetch_one("SELECT * FROM rooms WHERE room_id = %s", (room_id,))
 
     async def list_rooms(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT r.*,
+                   ls.started_at AS current_session_started_at,
+                   ls.detected_started_at AS current_session_detected_started_at
+            FROM rooms r
+            LEFT JOIN live_sessions ls ON ls.id = r.current_session_id
+        """
         if enabled_only:
-            return await self.fetch_all("SELECT * FROM rooms WHERE enabled = 1 ORDER BY id ASC")
-        return await self.fetch_all("SELECT * FROM rooms ORDER BY id ASC")
+            return await self.fetch_all(f"{sql} WHERE r.enabled = 1 ORDER BY r.id ASC")
+        return await self.fetch_all(f"{sql} ORDER BY r.id ASC")
 
     async def update_room(self, room_pk: int, *, enabled: Optional[bool], remark: Optional[str]) -> Optional[Dict[str, Any]]:
         updates: List[str] = []
@@ -314,6 +364,7 @@ class Database:
         room_title: str,
         anchor_uid: Optional[int],
         live_status: int,
+        live_started_at: Optional[datetime] = None,
     ) -> None:
         await self.execute(
             """
@@ -323,14 +374,155 @@ class Database:
                 anchor_uid = %s,
                 live_status = %s,
                 last_live_at = CASE
-                    WHEN %s = 1 AND live_status <> 1 THEN CURRENT_TIMESTAMP
+                    WHEN %s = 1 THEN COALESCE(%s, last_live_at, CURRENT_TIMESTAMP)
                     ELSE last_live_at
                 END,
                 last_checked_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             WHERE room_id = %s
             """,
-            (real_room_id, room_title, anchor_uid, live_status, live_status, room_id),
+            (real_room_id, room_title, anchor_uid, live_status, live_status, live_started_at, room_id),
+        )
+
+    async def ensure_live_session(
+        self,
+        *,
+        configured_room_id: int,
+        real_room_id: int,
+        room_title: str,
+        anchor_uid: Optional[int],
+        started_at: datetime,
+    ) -> Dict[str, Any]:
+        session = await self.fetch_one(
+            """
+            SELECT *
+            FROM live_sessions
+            WHERE room_id = %s
+              AND status = 'live'
+              AND ended_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (real_room_id,),
+        )
+        if session is None:
+            if self._pool is None:
+                raise RuntimeError("database is not connected")
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO live_sessions
+                            (room_id, configured_room_id, anchor_uid, room_title, started_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (real_room_id, configured_room_id, anchor_uid, room_title, started_at),
+                    )
+                    session_id = int(cursor.lastrowid)
+            session = await self.get_live_session(session_id)
+        else:
+            session_id = int(session["id"])
+            await self.execute(
+                """
+                UPDATE live_sessions
+                SET configured_room_id = %s,
+                    anchor_uid = %s,
+                    room_title = %s,
+                    started_at = %s,
+                    status = 'live',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+                """,
+                (configured_room_id, anchor_uid, room_title, started_at, session_id),
+            )
+            session = await self.get_live_session(session_id)
+
+        if session is None:
+            raise RuntimeError("failed to load live session")
+        await self.execute(
+            """
+            UPDATE rooms
+            SET current_session_id = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE room_id = %s
+            """,
+            (int(session["id"]), configured_room_id),
+        )
+        return session
+
+    async def finish_live_session(
+        self,
+        *,
+        configured_room_id: int,
+        real_room_id: int,
+        ended_at: Optional[datetime] = None,
+    ) -> None:
+        finished_at = ended_at or datetime.now()
+        await self.execute(
+            """
+            UPDATE live_sessions
+            SET status = 'ended',
+                ended_at = COALESCE(ended_at, %s),
+                detected_ended_at = COALESCE(detected_ended_at, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE room_id = %s
+              AND status = 'live'
+              AND ended_at IS NULL
+            """,
+            (finished_at, real_room_id),
+        )
+        await self.execute(
+            """
+            UPDATE rooms
+            SET current_session_id = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE room_id = %s
+              AND current_session_id IS NOT NULL
+            """,
+            (configured_room_id,),
+        )
+
+    async def get_live_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        return await self.fetch_one("SELECT * FROM live_sessions WHERE id = %s", (session_id,))
+
+    async def list_live_sessions(
+        self,
+        *,
+        room_id: Optional[int],
+        status: Optional[str],
+        limit: int,
+        offset: int,
+    ) -> List[Dict[str, Any]]:
+        filters: List[str] = []
+        params: List[Any] = []
+        if room_id is not None:
+            filters.append("(room_id = %s OR configured_room_id = %s)")
+            params.extend([room_id, room_id])
+        if status:
+            filters.append("status = %s")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.extend([limit, offset])
+        return await self.fetch_all(
+            f"""
+            SELECT id,
+                   room_id,
+                   configured_room_id,
+                   anchor_uid,
+                   room_title,
+                   started_at,
+                   detected_started_at,
+                   ended_at,
+                   detected_ended_at,
+                   status,
+                   created_at,
+                   updated_at
+            FROM live_sessions
+            {where_sql}
+            ORDER BY started_at DESC, id DESC
+            LIMIT %s OFFSET %s
+            """,
+            params,
         )
 
     async def touch_room_check(self, room_id: int) -> None:
@@ -345,14 +537,34 @@ class Database:
         await self.execute(
             """
             INSERT INTO room_events
-                (room_id, event_type, event_key, uid, username, content, raw_json, event_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (room_id, event_type, event_key, live_session_id, uid, username, content, raw_json, event_time)
+            VALUES (
+                %s,
+                %s,
+                %s,
+                (
+                    SELECT current_session_id
+                    FROM rooms
+                    WHERE (real_room_id = %s OR room_id = %s)
+                      AND current_session_id IS NOT NULL
+                    ORDER BY CASE WHEN real_room_id = %s THEN 0 ELSE 1 END
+                    LIMIT 1
+                ),
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
             ON DUPLICATE KEY UPDATE id = id
             """,
             (
                 event.room_id,
                 event.event_type,
                 event.event_key,
+                event.room_id,
+                event.room_id,
+                event.room_id,
                 event.uid,
                 event.username,
                 event.content,
@@ -369,6 +581,7 @@ class Database:
         start: Optional[datetime],
         end: Optional[datetime],
         before_id: Optional[int] = None,
+        live_session_id: Optional[int] = None,
         limit: int,
         offset: int,
     ) -> List[Dict[str, Any]]:
@@ -389,11 +602,24 @@ class Database:
         if before_id is not None:
             filters.append("id < %s")
             params.append(before_id)
+        if live_session_id is not None:
+            filters.append("live_session_id = %s")
+            params.append(live_session_id)
         where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
         params.extend([limit, offset])
         return await self.fetch_all(
             f"""
-            SELECT id, room_id, event_type, event_key, uid, username, content, raw_json, event_time, created_at
+            SELECT id,
+                   room_id,
+                   event_type,
+                   event_key,
+                   live_session_id,
+                   uid,
+                   username,
+                   content,
+                   raw_json,
+                   event_time,
+                   created_at
             FROM room_events
             {where_sql}
             ORDER BY id DESC

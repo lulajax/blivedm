@@ -304,9 +304,21 @@ function listeningBadge(room) {
     : '<span class="badge off">未监听</span>';
 }
 
+function sessionCell(room) {
+  if (!room.current_session_id || !room.current_session_started_at) {
+    return "-";
+  }
+  return `
+    <div class="session-cell">
+      <strong>#${escapeHtml(room.current_session_id)}</strong>
+      <div class="muted">${escapeHtml(formatTime(room.current_session_started_at))}</div>
+    </div>
+  `;
+}
+
 function renderRooms(rooms) {
   if (!rooms.length) {
-    roomsBody.innerHTML = '<tr><td colspan="6">暂无房间</td></tr>';
+    roomsBody.innerHTML = '<tr><td colspan="7">暂无房间</td></tr>';
     return;
   }
   const activeRoomFilter = eventRoomFilter.value.trim();
@@ -326,6 +338,7 @@ function renderRooms(rooms) {
           <td><div class="room-title" title="${title}">${title}</div></td>
           <td>${statusBadge(room)}</td>
           <td>${listeningBadge(room)}</td>
+          <td>${sessionCell(room)}</td>
           <td>${remark}</td>
           <td>
             <div class="actions">

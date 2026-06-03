@@ -102,10 +102,22 @@ class RoomCoordinator:
                     room_title=info.title,
                     anchor_uid=info.anchor_uid,
                     live_status=info.live_status,
+                    live_started_at=info.live_time,
                 )
                 if info.live_status != 1:
+                    await self._db.finish_live_session(
+                        configured_room_id=room_id,
+                        real_room_id=info.real_room_id,
+                    )
                     await self._db.finish_running_room_runs(info.real_room_id, "room offline")
                 else:
+                    session = await self._db.ensure_live_session(
+                        configured_room_id=room_id,
+                        real_room_id=info.real_room_id,
+                        room_title=info.title,
+                        anchor_uid=info.anchor_uid,
+                        started_at=info.live_time or datetime.now(),
+                    )
                     live_room = dict(room)
                     live_room.update(
                         {
@@ -113,6 +125,7 @@ class RoomCoordinator:
                             "room_title": info.title,
                             "anchor_uid": info.anchor_uid,
                             "live_status": info.live_status,
+                            "current_session_id": int(session["id"]),
                         }
                     )
                     confirmed_live_rooms.append(live_room)
@@ -123,6 +136,10 @@ class RoomCoordinator:
         for run in await self._db.running_monitor_runs():
             configured_room_id = int(run.get("configured_room_id") or run["room_id"])
             if configured_room_id not in enabled_room_ids:
+                await self._db.finish_live_session(
+                    configured_room_id=configured_room_id,
+                    real_room_id=int(run["room_id"]),
+                )
                 await self._db.finish_monitor_run(int(run["id"]), error_message="room disabled")
 
         return confirmed_live_rooms

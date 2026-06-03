@@ -131,9 +131,17 @@ async def create_room(payload: RoomCreate, request: Request):
 @app.patch("/api/rooms/{room_pk}")
 async def update_room(room_pk: int, payload: RoomPatch, request: Request):
     db = get_db(request)
+    old_room = await db.get_room(room_pk)
+    if old_room is None:
+        raise HTTPException(status_code=404, detail="room not found")
     room = await db.update_room(room_pk, enabled=payload.enabled, remark=payload.remark)
     if room is None:
         raise HTTPException(status_code=404, detail="room not found")
+    if payload.enabled is False:
+        await db.finish_live_session(
+            configured_room_id=int(old_room["room_id"]),
+            real_room_id=int(old_room.get("real_room_id") or old_room["room_id"]),
+        )
     get_coordinator(request).wake()
     active = set(await db.active_monitor_room_ids())
     room["listening"] = int(room.get("real_room_id") or room["room_id"]) in active
@@ -146,6 +154,10 @@ async def delete_room(room_pk: int, request: Request):
     room = await db.get_room(room_pk)
     if room is None:
         raise HTTPException(status_code=404, detail="room not found")
+    await db.finish_live_session(
+        configured_room_id=int(room["room_id"]),
+        real_room_id=int(room.get("real_room_id") or room["room_id"]),
+    )
     deleted = await db.delete_room(room_pk)
     get_coordinator(request).wake()
     return {"deleted": deleted}
@@ -159,6 +171,7 @@ async def list_events(
     start: Optional[str] = None,
     end: Optional[str] = None,
     before_id: Optional[int] = Query(None, ge=1),
+    live_session_id: Optional[int] = Query(None, ge=1),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -169,6 +182,7 @@ async def list_events(
         start=parse_datetime(start),
         end=parse_datetime(end),
         before_id=before_id,
+        live_session_id=live_session_id,
         limit=limit + 1,
         offset=offset,
     )
@@ -177,6 +191,27 @@ async def list_events(
         "items": items,
         "has_more": len(events) > limit,
         "next_before_id": min((int(item["id"]) for item in items), default=None),
+    }
+
+
+@app.get("/api/live-sessions")
+async def list_live_sessions(
+    request: Request,
+    room_id: Optional[int] = None,
+    status: Optional[str] = Query(None, pattern="^(live|ended)$"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    sessions = await get_db(request).list_live_sessions(
+        room_id=room_id,
+        status=status,
+        limit=limit + 1,
+        offset=offset,
+    )
+    items = sessions[:limit]
+    return {
+        "items": items,
+        "has_more": len(sessions) > limit,
     }
 
 

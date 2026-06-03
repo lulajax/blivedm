@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.cookies
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -19,6 +20,7 @@ class BiliRoomInfo:
     title: str
     anchor_uid: Optional[int]
     live_status: int
+    live_time: Optional[datetime]
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,16 @@ def apply_bili_cookie(session: aiohttp.ClientSession, sessdata: str) -> None:
     session.cookie_jar.update_cookies(cookies)
 
 
+def parse_bili_live_time(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text or text == "0000-00-00 00:00:00":
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
 async def fetch_room_info(session: aiohttp.ClientSession, room_id: int) -> BiliRoomInfo:
     async with session.get(
         ROOM_INFO_URL,
@@ -61,6 +73,7 @@ async def fetch_room_info(session: aiohttp.ClientSession, room_id: int) -> BiliR
         title=str(data.get("title") or ""),
         anchor_uid=int(data["uid"]) if data.get("uid") is not None else None,
         live_status=int(data.get("live_status") or 0),
+        live_time=parse_bili_live_time(data.get("live_time")),
     )
 
 
