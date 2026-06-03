@@ -1,0 +1,105 @@
+# blivedm 拆分式直播间监控
+
+这个仓库拆成两个可以独立运行的 Python 项目：
+
+- `api/`：FastAPI 调度端。负责 MySQL、直播间管理、B 站 HTTP 接口、直播状态轮询、WebSocket 采集任务生成、事件解析和事件入库。
+- `client/`：采集客户端。负责从 API 拉取任务，使用 API 下发的参数连接 B 站弹幕 WebSocket，通过 `blivedm` 解码/解压消息，并把原始命令回传给 API。
+
+采集客户端不调用 B 站 HTTP 接口，也不连接 MySQL。
+
+## 项目备注
+
+- API 进程是控制面：保存直播间配置，轮询 B 站 HTTP 接口，判断哪些房间正在直播，并创建短生命周期的采集任务。
+- client 进程是数据面：维护长时间运行的 B 站 WebSocket 连接，并把解码后的原始命令转发回 API。
+- 这样拆分后，数据库账号和可选的 B 站 Cookie 都留在 API 侧。采集端部署到其他机器时只需要 `API_BASE_URL` 和 `COLLECTOR_CLIENT_ID`。
+- B 站同时存在“配置房间号”和“真实房间号”。管理页输入的是配置房间号，API 会保存 B 站返回的真实房间号，并用真实房间号做 WebSocket 采集。
+- 采集端把原始命令提交到 `/internal/events/batch`。事件解析集中在 API 侧，后续调整解析规则时不需要重新部署每个采集端。
+- 当前入库的业务事件包括 `danmaku`、`enter_room`、`gift`、`guard`、`super_chat`。删除醒目留言、互动提示、点赞提示、购物车、排名变化、连麦状态、礼物连击和其他高频展示噪声命令会被主动忽略。
+- `BILI_SESSDATA` 是可选项。普通直播间可能匿名也能访问，但如果 B 站对房间信息或 WebSocket 配置加强校验，配置 Cookie 会更稳。
+
+## 运行方式
+
+```sh
+cd api
+cp .env.example .env
+# 编辑 .env，至少设置 MYSQL_PASSWORD
+uv sync --extra test
+uv run python -m blivedm_api.main
+```
+
+```sh
+cd client
+cp .env.example .env
+uv sync
+uv run python -m blivedm_client.main
+```
+
+管理页：`http://127.0.0.1:8000/`
+
+## 数据流
+
+1. API 通过 B 站 HTTP 接口轮询已启用直播间。
+2. API 只为正在直播的房间创建采集任务。
+3. client 从 `/internal/collector/tasks` 拉取任务。
+4. client 连接 B 站弹幕 WebSocket，并解码消息。
+5. client 把原始命令提交到 `/internal/events/batch`。
+6. API 解析事件并写入 MySQL。
+
+## 时序图
+
+下面的时序图描述项目的主链路：管理页配置直播间，API 调度端轮询 B 站并生成采集任务，client 认领任务后连接 B 站 WebSocket，最后把原始命令批量回传给 API 入库。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Admin as 管理页
+    participant API as API 调度端
+    participant DB as MySQL
+    participant BiliHTTP as B站 HTTP API
+    participant Client as 采集客户端
+    participant BiliWS as B站弹幕 WebSocket
+
+    Admin->>API: 新增/启用直播间
+    API->>DB: 保存 rooms 配置
+    API->>API: 唤醒房间调度器
+
+    loop 定时轮询或被唤醒
+        API->>DB: 读取已启用直播间
+        API->>BiliHTTP: 查询房间信息和直播状态
+        BiliHTTP-->>API: 返回真实房间号、标题、主播 UID、直播状态
+        API->>DB: 更新 rooms 状态
+        alt 房间未开播
+            API->>DB: 关闭该房间运行中的 monitor_runs
+        else 房间正在直播
+            API->>DB: 保留可被认领的直播房间状态
+        end
+    end
+
+    loop client 按间隔拉取任务
+        Client->>API: GET /internal/collector/tasks?client_id=...
+        API->>DB: 清理过期 monitor_runs
+        API->>DB: 为直播房间认领或续租 monitor_run
+        API->>BiliHTTP: 初始化 WebSocket 采集参数
+        BiliHTTP-->>API: 返回 host_list、token、uid、buvid
+        API-->>Client: 返回 run_id 和 WebSocket 任务参数
+    end
+
+    Client->>BiliWS: 使用任务参数建立弹幕 WebSocket
+    loop 直播间消息持续到达
+        BiliWS-->>Client: 下发压缩/编码后的弹幕命令
+        Client->>Client: 通过 blivedm 解码和解压
+        Client->>API: POST /internal/events/batch
+        API->>API: 解析 danmaku、enter_room、gift 等业务事件
+        API->>DB: 写入 room_events，按 event_key 去重
+    end
+
+    par 采集心跳
+        loop run 存活期间
+            Client->>API: POST /internal/collector/runs/{run_id}/heartbeat
+            API->>DB: 更新 last_heartbeat_at
+        end
+    and 停止或异常
+        Client->>API: POST /internal/collector/runs/{run_id}/stop
+        API->>DB: 标记 monitor_run 已停止并保存原因
+    end
+```

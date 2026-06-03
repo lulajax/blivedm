@@ -1,0 +1,25 @@
+[project]
+name = "blivedm-api"
+version = "0.1.0"
+description = "API coordinator for Bilibili live room monitoring."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "aiomysql>=0.2.0,<1.0.0",
+    "aiohttp>=3.9.0,<4.0.0",
+    "blivedm @ git+https://github.com/xfgryujk/blivedm.git@dev",
+    "cryptography>=42.0.0,<47.0.0",
+    "fastapi>=0.110.0,<1.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+    "uvicorn[standard]>=0.27.0,<1.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0.0,<9.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

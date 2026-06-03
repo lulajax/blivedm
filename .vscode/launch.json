@@ -1,0 +1,56 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "API (FastAPI Coordinator)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "blivedm_api.main",
+      "cwd": "${workspaceFolder}/api",
+      "python": "${workspaceFolder}/api/.venv/bin/python",
+      "envFile": "${workspaceFolder}/api/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "serverReadyAction": {
+        "pattern": "Uvicorn running on http://[^:]+:([0-9]+)",
+        "uriFormat": "http://127.0.0.1:%s",
+        "action": "openExternally"
+      }
+    },
+    {
+      "name": "Client (Collector)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "blivedm_client.main",
+      "cwd": "${workspaceFolder}/client",
+      "python": "${workspaceFolder}/client/.venv/bin/python",
+      "envFile": "${workspaceFolder}/client/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "API Tests (pytest)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": [
+        "-q"
+      ],
+      "cwd": "${workspaceFolder}/api",
+      "python": "${workspaceFolder}/api/.venv/bin/python",
+      "envFile": "${workspaceFolder}/api/.env",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ],
+  "compounds": [
+    {
+      "name": "API + Client",
+      "configurations": [
+        "API (FastAPI Coordinator)",
+        "Client (Collector)"
+      ],
+      "stopAll": true
+    }
+  ]
+}

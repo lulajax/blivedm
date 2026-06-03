@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>blivedm Monitor</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>B站直播监控</h1>
+        <p>房间轮询、采集任务下发、事件入库</p>
+      </div>
+      <button id="refreshBtn" type="button">刷新</button>
+    </header>
+
+    <main class="layout">
+      <section class="panel room-panel">
+        <div class="panel-head">
+          <h2>监控房间</h2>
+          <span id="statusText">加载中</span>
+        </div>
+
+        <form id="roomForm" class="room-form">
+          <input id="roomInput" name="room" autocomplete="off" placeholder="直播间 URL 或房间号" required />
+          <input id="remarkInput" name="remark" autocomplete="off" placeholder="备注" />
+          <button type="submit">添加</button>
+        </form>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>房间</th>
+                <th>标题</th>
+                <th>状态</th>
+                <th>监听</th>
+                <th>备注</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="roomsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel event-panel">
+        <div class="panel-head">
+          <h2>最新事件</h2>
+          <div class="filters">
+            <input id="eventRoomFilter" inputmode="numeric" placeholder="房间号" />
+            <select id="eventTypeFilter">
+              <option value="">全部事件</option>
+              <option value="danmaku">弹幕</option>
+              <option value="enter_room">进房</option>
+              <option value="gift">礼物</option>
+              <option value="guard">上舰</option>
+              <option value="super_chat">醒目留言</option>
+              <option value="unknown">未知</option>
+              <option value="parse_error">解析错误</option>
+            </select>
+          </div>
+        </div>
+        <div id="eventsList" class="events-list"></div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
