@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,19 @@ from .config import Settings
 from .db import Database
 
 logger = logging.getLogger(__name__)
+
+# 直播状态短 TTL 缓存：claim_tasks 每 ~10s 触发一次，缓存可避免每次都对
+# 所有 enabled 房间全量请求 B 站房间信息（高频请求是 B 站风控的主要来源）。
+_LIVE_STATUS_CACHE_SECONDS = 15
+# 新建 run 拉弹幕配置的重试次数与退避（秒），抵御 B 站瞬时风控/抖动。
+_COLLECT_CONFIG_ATTEMPTS = 3
+_COLLECT_CONFIG_BACKOFF_SECONDS = 0.6
+
+
+@dataclass(frozen=True)
+class ClaimedTaskResult:
+    tasks: List[Dict[str, Any]]
+    keep_run_ids: List[int]
 
 
 class RoomCoordinator:
@@ -28,6 +42,8 @@ class RoomCoordinator:
         self._task: Optional[asyncio.Task] = None
         self._wake_event = asyncio.Event()
         self._stopping = False
+        self._live_status_cache: Optional[List[Dict[str, Any]]] = None
+        self._live_status_cache_at: Optional[datetime] = None
 
     @property
     def is_running(self) -> bool:
@@ -141,22 +157,56 @@ class RoomCoordinator:
                 )
                 await self._db.finish_monitor_run(int(run["id"]), error_message="room disabled")
 
+        self._live_status_cache = confirmed_live_rooms
+        self._live_status_cache_at = datetime.now()
         return confirmed_live_rooms
 
-    async def claim_tasks(self, client_id: str, limit: int) -> List[Dict[str, Any]]:
+    async def _live_rooms_cached(self) -> List[Dict[str, Any]]:
+        # claim_tasks 高频触发，这里用短 TTL 缓存复用最近一次 poll_once 的
+        # 直播间快照；后台 _loop 仍按 room_poll_interval_seconds 刷新缓存。
+        now = datetime.now()
+        if (
+            self._live_status_cache is not None
+            and self._live_status_cache_at is not None
+            and (now - self._live_status_cache_at).total_seconds() < _LIVE_STATUS_CACHE_SECONDS
+        ):
+            return self._live_status_cache
+        return await self.poll_once()
+
+    async def _fetch_collect_config_with_retry(self, session: aiohttp.ClientSession, room_id: int):
+        last_exc: Optional[Exception] = None
+        for attempt in range(_COLLECT_CONFIG_ATTEMPTS):
+            try:
+                return await fetch_collect_config(session, room_id)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if attempt + 1 < _COLLECT_CONFIG_ATTEMPTS:
+                    await asyncio.sleep(_COLLECT_CONFIG_BACKOFF_SECONDS * (attempt + 1))
+        logger.warning(
+            "collect config failed room=%s after %s attempts: %s",
+            room_id,
+            _COLLECT_CONFIG_ATTEMPTS,
+            last_exc,
+        )
+        return None
+
+    async def claim_tasks(self, client_id: str, limit: int) -> ClaimedTaskResult:
         if self._session is None:
             raise RuntimeError("coordinator session is not initialized")
 
         await self._db.touch_collector_client(client_id)
         client_config = await self._db.get_collector_client_runtime_config(client_id)
         if not client_config["enabled"]:
-            return []
+            return ClaimedTaskResult(tasks=[], keep_run_ids=[])
         client_sessdata = str(client_config["bili_sessdata"] or "")
         max_active_rooms = max(1, int(client_config["max_active_rooms"] or 50))
         effective_limit = min(limit, max_active_rooms)
-        # 任务认领是按需触发的：先刷新所有 enabled 房间的直播状态，
-        # 再只使用本轮成功确认 live_status=1 的房间生成任务，避免旧缓存误下发。
-        live_rooms = await self.poll_once()
+        # 让 poll_once 的房间信息(get_info)请求也带上采集端的 SESSDATA，
+        # 降低 B 站风控概率。
+        apply_bili_cookie(self._session, client_sessdata)
+        # 任务认领按需触发：直播状态用短 TTL 缓存复用，避免每次都全量请求
+        # B 站。复制一份再排序，避免改动被多个 client 共享的缓存。
+        live_rooms = list(await self._live_rooms_cached())
         owned_room_ids = set(await self._db.active_monitor_room_ids_for_client(client_id))
         live_rooms.sort(
             key=lambda item: (
@@ -165,6 +215,7 @@ class RoomCoordinator:
             )
         )
         tasks: List[Dict[str, Any]] = []
+        keep_run_ids: List[int] = []
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as collect_session:
             apply_bili_cookie(collect_session, client_sessdata)
             for room in live_rooms:
@@ -182,15 +233,31 @@ class RoomCoordinator:
                 if run is None:
                     continue
 
-                try:
-                    config = await fetch_collect_config(collect_session, real_room_id)
-                except Exception as exc:  # noqa: BLE001
-                    await self._db.finish_monitor_run(int(run["id"]), error_message=f"collect config failed: {exc}")
-                    logger.warning("failed to create collect config room=%s client=%s: %s", real_room_id, client_id, exc)
+                run_id = int(run["id"])
+                # 复用中的 run：采集端已经连着 WebSocket，无需再向 B 站要弹幕
+                # 配置。只告诉采集端保留它即可——这避免了对 getDanmuInfo 的每轮
+                # 高频调用（之前稳定的 run 也会被反复重拉配置，是风控的主因）。
+                if run.get("reused_existing"):
+                    keep_run_ids.append(run_id)
+                    continue
+
+                # 只有新建 run 才拉配置，并做有限重试；一次瞬时失败不再立刻
+                # 把刚建好的 run 杀掉、下一轮又重建（即“监听不停断开”的抖动）。
+                config = await self._fetch_collect_config_with_retry(collect_session, real_room_id)
+                if config is None:
+                    await self._db.finish_monitor_run(
+                        run_id, error_message=f"collect config failed for room={real_room_id}"
+                    )
+                    logger.warning(
+                        "failed to create collect config room=%s client=%s after %s attempts",
+                        real_room_id,
+                        client_id,
+                        _COLLECT_CONFIG_ATTEMPTS,
+                    )
                     continue
                 tasks.append(
                     {
-                        "run_id": int(run["id"]),
+                        "run_id": run_id,
                         "room_id": config.room_id,
                         "configured_room_id": configured_room_id,
                         "room_title": str(room.get("room_title") or ""),
@@ -204,4 +271,12 @@ class RoomCoordinator:
                     }
                 )
 
-        return tasks
+        logger.info(
+            "claimed collector tasks client=%s tasks=%s keep=%s effective_limit=%s owned_rooms=%s",
+            client_id,
+            [int(task["run_id"]) for task in tasks],
+            keep_run_ids,
+            effective_limit,
+            sorted(owned_room_ids),
+        )
+        return ClaimedTaskResult(tasks=tasks, keep_run_ids=keep_run_ids)

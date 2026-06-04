@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.cookies
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,7 @@ from blivedm import utils as blivedm_utils
 
 
 ROOM_INFO_URL = "https://api.live.bilibili.com/room/v1/Room/get_info"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -100,12 +102,12 @@ async def fetch_collect_config(session: aiohttp.ClientSession, room_id: int) -> 
     # 然后把这些参数下发给 client，避免 client 再访问 B 站 HTTP 接口。
     client = blivedm.BLiveClient(room_id, session=session)
     ok = await client.init_room()
-    if not ok:
-        raise RuntimeError(f"failed to initialize danmaku config for room={room_id}")
 
     host_list = getattr(client, "_host_server_list", None) or []
     if not host_list:
         raise RuntimeError(f"empty danmaku host list for room={room_id}")
+    if not ok:
+        logger.warning("room=%s using degraded danmaku config from blivedm fallback", room_id)
 
     return BiliCollectConfig(
         room_id=int(client.room_id or room_id),

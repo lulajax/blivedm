@@ -93,8 +93,15 @@ class CollectClientService:
 
         # API 返回当前 client 应该持有的 run 集合。新增 run 在本地启动，
         # 被撤销的 run 会停止并回报给 API。
-        tasks = await self._api.fetch_tasks()
+        snapshot = await self._api.fetch_tasks()
+        tasks = snapshot.tasks
         desired = {task.run_id: task for task in tasks}
+        logger.info(
+            "collector task sync active=%s desired=%s keep=%s",
+            sorted(self._active.keys()),
+            sorted(desired.keys()),
+            sorted(snapshot.keep_run_ids),
+        )
 
         for task in tasks:
             active = self._active.get(task.run_id)
@@ -102,7 +109,7 @@ class CollectClientService:
                 await self.start_task(task)
 
         for run_id in list(self._active.keys()):
-            if run_id not in desired:
+            if run_id not in desired and run_id not in snapshot.keep_run_ids:
                 await self.stop_run(run_id, "collector task revoked")
 
     async def start_task(self, task: CollectTask) -> None:
@@ -160,6 +167,7 @@ class CollectClientService:
         while True:
             ok = await self._api.heartbeat(run_id)
             if not ok:
+                logger.warning("collector heartbeat rejected run=%s", run_id)
                 asyncio.create_task(self.stop_run(run_id, "collector run no longer active"))
                 return
             await asyncio.sleep(self._settings.run_heartbeat_interval_seconds)
@@ -176,6 +184,12 @@ class CollectClientService:
             error_message = str(exc)
             logger.exception("collector websocket failed run=%s room=%s", task.run_id, task.room_id)
         finally:
+            logger.info(
+                "collector websocket finished run=%s room=%s error=%s",
+                task.run_id,
+                task.room_id,
+                error_message,
+            )
             # 无论正常停止还是异常退出，都要关闭 B 站连接并上报停止原因，
             # 避免 monitor_runs 中留下长时间 running 的脏数据。
             await client.stop_and_close()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -9,6 +10,8 @@ from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 import aiomysql
 
 from .config import Settings
+
+logger = logging.getLogger(__name__)
 
 
 def mask_secret(value: str) -> str:
@@ -1595,6 +1598,7 @@ class Database:
             raise RuntimeError("database is not connected")
 
         claimed_run_id: Optional[int] = None
+        reused_existing = False
         async with self._pool.acquire() as conn:
             await conn.begin()
             try:
@@ -1646,6 +1650,7 @@ class Database:
 
                     if lease_client_id == client_id and lease_run_id is not None and run_running:
                         claimed_run_id = lease_run_id
+                        reused_existing = True
                         await cursor.execute(
                             """
                             UPDATE monitor_runs
@@ -1707,7 +1712,10 @@ class Database:
 
         if claimed_run_id is None:
             return None
-        return await self.get_monitor_run(claimed_run_id)
+        run = await self.get_monitor_run(claimed_run_id)
+        if run is not None:
+            run["reused_existing"] = reused_existing
+        return run
 
     async def get_monitor_run(self, run_id: int) -> Optional[Dict[str, Any]]:
         return await self.fetch_one(
@@ -1758,6 +1766,7 @@ class Database:
                 raise
 
     async def finish_running_room_runs(self, room_id: int, reason: str) -> None:
+        logger.info("finishing running monitor runs room=%s reason=%s", room_id, reason)
         await self.execute(
             """
             UPDATE room_collect_leases
@@ -1781,6 +1790,7 @@ class Database:
         )
 
     async def finish_monitor_run(self, run_id: int, *, error_message: Optional[str] = None) -> None:
+        logger.info("finishing monitor run=%s reason=%s", run_id, error_message)
         await self.execute(
             """
             UPDATE room_collect_leases
@@ -1809,6 +1819,7 @@ class Database:
         client_id: str,
         error_message: Optional[str] = None,
     ) -> bool:
+        logger.info("client requested monitor run stop run=%s client=%s reason=%s", run_id, client_id, error_message)
         rowcount = await self.execute(
             """
             UPDATE monitor_runs

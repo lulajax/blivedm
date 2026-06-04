@@ -54,13 +54,16 @@ class FakeDatabase:
         max_active_rooms=50,
         owned_room_ids=None,
         denied_room_ids=None,
+        reused_room_ids=None,
     ):
         self.client_enabled = client_enabled
         self.max_active_rooms = max_active_rooms
         self.owned_room_ids = set(owned_room_ids or [])
         self.denied_room_ids = set(denied_room_ids or [])
+        self.reused_room_ids = set(reused_room_ids or [])
         self.touched_clients = []
         self.claimed_rooms = []
+        self.finished_runs = []
         self.rooms = [
             {"room_id": 1001, "real_room_id": 1001, "room_title": "r1", "anchor_uid": 11, "enabled": 1},
             {"room_id": 1002, "real_room_id": 1002, "room_title": "r2", "anchor_uid": 22, "enabled": 1},
@@ -113,7 +116,11 @@ class FakeDatabase:
             "configured_room_id": configured_room_id,
             "client_id": client_id,
             "running": 1,
+            "reused_existing": room_id in self.reused_room_ids,
         }
+
+    async def finish_monitor_run(self, run_id, *, error_message=None):
+        self.finished_runs.append((run_id, error_message))
 
 
 async def install_bili_fakes(monkeypatch):
@@ -146,7 +153,8 @@ async def test_disabled_collector_gets_no_tasks(monkeypatch):
 
     tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
 
-    assert tasks == []
+    assert tasks.tasks == []
+    assert tasks.keep_run_ids == []
     assert db.touched_clients == ["client-a"]
     assert db.claimed_rooms == []
 
@@ -157,7 +165,8 @@ async def test_collector_max_active_rooms_limits_task_count(monkeypatch):
 
     tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
 
-    assert [task["room_id"] for task in tasks] == [1001]
+    assert [task["room_id"] for task in tasks.tasks] == [1001]
+    assert tasks.keep_run_ids == []
     assert db.claimed_rooms == [1001]
 
 
@@ -167,7 +176,8 @@ async def test_owned_rooms_are_prioritized_when_capacity_is_limited(monkeypatch)
 
     tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
 
-    assert [task["room_id"] for task in tasks] == [1002]
+    assert [task["room_id"] for task in tasks.tasks] == [1002]
+    assert tasks.keep_run_ids == []
     assert db.claimed_rooms == [1002]
 
 
@@ -177,5 +187,48 @@ async def test_room_with_active_foreign_lease_is_not_returned(monkeypatch):
 
     tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
 
-    assert [task["room_id"] for task in tasks] == [1002]
+    assert [task["room_id"] for task in tasks.tasks] == [1002]
+    assert tasks.keep_run_ids == []
     assert db.claimed_rooms == [1001, 1002]
+
+
+async def test_new_run_collect_config_failure_finishes_run(monkeypatch):
+    db = FakeDatabase()
+    coordinator = await build_coordinator(monkeypatch, db)
+
+    async def fake_fetch_collect_config(session, room_id):
+        if room_id == 1001:
+            raise RuntimeError("temporary -352")
+        return FakeCollectConfig(room_id=room_id, anchor_uid=room_id + 10)
+
+    monkeypatch.setattr(coordinator_module, "fetch_collect_config", fake_fetch_collect_config)
+
+    tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
+
+    assert [task["room_id"] for task in tasks.tasks] == [1002]
+    assert tasks.keep_run_ids == []
+    # 重试耗尽后才结束 run；错误信息不再内联底层异常文本。
+    assert db.finished_runs == [(1101, "collect config failed for room=1001")]
+
+
+async def test_reused_run_skips_collect_config_fetch(monkeypatch):
+    # 复用中的 run 不应再向 B 站拉弹幕配置，只进入 keep_run_ids；
+    # 这是消除“监听不停断开”抖动的关键（避免对 getDanmuInfo 的高频调用）。
+    db = FakeDatabase(reused_room_ids={1001})
+    coordinator = await build_coordinator(monkeypatch, db)
+
+    fetched_rooms = []
+
+    async def fake_fetch_collect_config(session, room_id):
+        fetched_rooms.append(room_id)
+        return FakeCollectConfig(room_id=room_id, anchor_uid=room_id + 10)
+
+    monkeypatch.setattr(coordinator_module, "fetch_collect_config", fake_fetch_collect_config)
+
+    tasks = await coordinator.claim_tasks(client_id="client-a", limit=50)
+
+    # 复用 run(1001) 进 keep，不进 tasks，也不触发配置拉取；新 run(1002) 正常拉取。
+    assert [task["room_id"] for task in tasks.tasks] == [1002]
+    assert tasks.keep_run_ids == [1101]
+    assert db.finished_runs == []
+    assert fetched_rooms == [1002]

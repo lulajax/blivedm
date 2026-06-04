@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import aiohttp
 
@@ -47,12 +47,18 @@ class CollectTask:
         return (self.room_id, self.uid, self.buvid, self.token, hosts, self.heartbeat_interval)
 
 
+@dataclass(frozen=True)
+class TaskSnapshot:
+    tasks: List[CollectTask]
+    keep_run_ids: Set[int]
+
+
 class ApiClient:
     def __init__(self, settings: Settings, session: aiohttp.ClientSession):
         self._settings = settings
         self._session = session
 
-    async def fetch_tasks(self) -> List[CollectTask]:
+    async def fetch_tasks(self) -> TaskSnapshot:
         # client_id 用来区分不同采集进程，API 会用它维护 run 租约和心跳。
         async with self._session.get(
             self._settings.task_url,
@@ -60,7 +66,10 @@ class ApiClient:
         ) as response:
             response.raise_for_status()
             payload = await response.json()
-        return [CollectTask.from_payload(item) for item in payload.get("items", [])]
+        return TaskSnapshot(
+            tasks=[CollectTask.from_payload(item) for item in payload.get("items", [])],
+            keep_run_ids={int(run_id) for run_id in payload.get("keep_run_ids", [])},
+        )
 
     async def heartbeat(self, run_id: int) -> bool:
         async with self._session.post(

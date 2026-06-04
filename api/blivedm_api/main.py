@@ -292,11 +292,12 @@ async def collect_tasks(
 ):
     # 任务认领同时也是租约机制：一个直播间同一时间只分配给一个
     # 新鲜的 collector run，后续靠心跳避免被判定为过期。
-    tasks = await get_coordinator(request).claim_tasks(client_id=client_id, limit=limit)
+    result = await get_coordinator(request).claim_tasks(client_id=client_id, limit=limit)
     return {
         "client_id": client_id,
         "poll_interval_seconds": request.app.state.settings.collector_task_poll_interval_seconds,
-        "items": tasks,
+        "items": result.tasks,
+        "keep_run_ids": result.keep_run_ids,
     }
 
 
