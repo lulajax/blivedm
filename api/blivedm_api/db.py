@@ -1,14 +1,56 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
 import aiomysql
 
 from .config import Settings
 
+
+def mask_secret(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) <= 10:
+        return "*" * len(text)
+    return f"{text[:4]}...{text[-4:]}"
+
+
+CREATE_COLLECTOR_CLIENTS_SQL = """
+CREATE TABLE IF NOT EXISTS collector_clients (
+    client_id VARCHAR(128) NOT NULL,
+    bili_sessdata LONGTEXT NOT NULL,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    max_active_rooms INT NOT NULL DEFAULT 50,
+    remark VARCHAR(255) NOT NULL DEFAULT '',
+    last_seen_at DATETIME NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (client_id),
+    KEY idx_collector_clients_last_seen (last_seen_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_ROOM_COLLECT_LEASES_SQL = """
+CREATE TABLE IF NOT EXISTS room_collect_leases (
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    client_id VARCHAR(128) NOT NULL,
+    run_id BIGINT NULL,
+    lease_expires_at DATETIME NOT NULL,
+    last_heartbeat_at DATETIME NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (room_id),
+    KEY idx_room_collect_leases_client (client_id),
+    KEY idx_room_collect_leases_run (run_id),
+    KEY idx_room_collect_leases_expires (lease_expires_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
 
 CREATE_ROOMS_SQL = """
 CREATE TABLE IF NOT EXISTS rooms (
@@ -50,6 +92,219 @@ CREATE TABLE IF NOT EXISTS room_events (
     KEY idx_room_events_session_created (live_session_id, created_at),
     KEY idx_room_events_room_created (room_id, created_at),
     KEY idx_room_events_type_created (event_type, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_EVENT_PROJECTION_STATE_SQL = """
+CREATE TABLE IF NOT EXISTS event_projection_state (
+    name VARCHAR(64) NOT NULL,
+    last_event_id BIGINT NOT NULL DEFAULT 0,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_EVENT_TIME_DETAILS_SQL = """
+CREATE TABLE IF NOT EXISTS event_time_details (
+    event_id BIGINT NOT NULL,
+    event_type VARCHAR(50) NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    event_at DATETIME NOT NULL,
+    ingested_at DATETIME NOT NULL,
+    timezone VARCHAR(64) NOT NULL,
+    date_key INT NOT NULL,
+    hour_key INT NOT NULL,
+    minute_key BIGINT NOT NULL,
+    event_date DATE NOT NULL,
+    hour_start_at DATETIME NOT NULL,
+    minute_start_at DATETIME NOT NULL,
+    year SMALLINT NOT NULL,
+    quarter TINYINT NOT NULL,
+    month TINYINT NOT NULL,
+    day TINYINT NOT NULL,
+    hour TINYINT NOT NULL,
+    minute TINYINT NOT NULL,
+    second TINYINT NOT NULL,
+    weekday TINYINT NOT NULL,
+    iso_week TINYINT NOT NULL,
+    is_weekend TINYINT(1) NOT NULL,
+    session_started_at DATETIME NULL,
+    session_elapsed_seconds BIGINT NULL,
+    ingest_delay_seconds BIGINT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_event_time_details_type_date (event_type, date_key),
+    KEY idx_event_time_details_room_minute (room_id, minute_key),
+    KEY idx_event_time_details_session_minute (live_session_id, minute_key),
+    KEY idx_event_time_details_uid_date (uid, date_key),
+    KEY idx_event_time_details_anchor_date (anchor_uid, date_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_DANMAKU_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS danmaku_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    content_length INT NOT NULL DEFAULT 0,
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    guard_level INT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_danmaku_events_room_time (room_id, event_at),
+    KEY idx_danmaku_events_session_time (live_session_id, event_at),
+    KEY idx_danmaku_events_uid_time (uid, event_at),
+    KEY idx_danmaku_events_anchor_time (anchor_uid, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_ENTER_ROOM_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS enter_room_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    action_text VARCHAR(255) NOT NULL DEFAULT '',
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    guard_level INT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_enter_room_events_room_time (room_id, event_at),
+    KEY idx_enter_room_events_session_time (live_session_id, event_at),
+    KEY idx_enter_room_events_uid_time (uid, event_at),
+    KEY idx_enter_room_events_anchor_time (anchor_uid, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_GIFT_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS gift_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    gift_id BIGINT NULL,
+    gift_name VARCHAR(255) NOT NULL DEFAULT '',
+    gift_num INT NOT NULL DEFAULT 0,
+    gift_price BIGINT NULL,
+    gift_total_price BIGINT NULL,
+    coin_type VARCHAR(32) NOT NULL DEFAULT '',
+    batch_combo_id VARCHAR(191) NOT NULL DEFAULT '',
+    combo_id VARCHAR(191) NOT NULL DEFAULT '',
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    guard_level INT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_gift_events_room_time (room_id, event_at),
+    KEY idx_gift_events_session_time (live_session_id, event_at),
+    KEY idx_gift_events_uid_time (uid, event_at),
+    KEY idx_gift_events_anchor_time (anchor_uid, event_at),
+    KEY idx_gift_events_gift_time (gift_id, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_GUARD_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS guard_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    guard_level INT NULL,
+    guard_name VARCHAR(64) NOT NULL DEFAULT '',
+    guard_num INT NOT NULL DEFAULT 0,
+    gift_id BIGINT NULL,
+    gift_name VARCHAR(255) NOT NULL DEFAULT '',
+    price BIGINT NULL,
+    total_price BIGINT NULL,
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_guard_events_room_time (room_id, event_at),
+    KEY idx_guard_events_session_time (live_session_id, event_at),
+    KEY idx_guard_events_uid_time (uid, event_at),
+    KEY idx_guard_events_anchor_time (anchor_uid, event_at),
+    KEY idx_guard_events_level_time (guard_level, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_SUPER_CHAT_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS super_chat_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    super_chat_id BIGINT NULL,
+    message TEXT NOT NULL,
+    message_length INT NOT NULL DEFAULT 0,
+    price DECIMAL(12,2) NULL,
+    start_time DATETIME NULL,
+    end_time DATETIME NULL,
+    duration_seconds INT NULL,
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    guard_level INT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_super_chat_events_room_time (room_id, event_at),
+    KEY idx_super_chat_events_session_time (live_session_id, event_at),
+    KEY idx_super_chat_events_uid_time (uid, event_at),
+    KEY idx_super_chat_events_anchor_time (anchor_uid, event_at),
+    KEY idx_super_chat_events_price_time (price, event_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -110,6 +365,17 @@ class EventRecord:
     event_time: Optional[datetime]
 
 
+ANALYTIC_EVENT_TABLES = frozenset(
+    {
+        "danmaku_events",
+        "enter_room_events",
+        "gift_events",
+        "guard_events",
+        "super_chat_events",
+    }
+)
+
+
 class Database:
     def __init__(self, settings: Settings):
         self._settings = settings
@@ -136,16 +402,28 @@ class Database:
         self._pool = None
 
     async def migrate(self) -> None:
+        await self.execute(CREATE_COLLECTOR_CLIENTS_SQL)
         await self.execute(CREATE_ROOMS_SQL)
         await self.execute(CREATE_LIVE_SESSIONS_SQL)
         await self.execute(CREATE_ROOM_EVENTS_SQL)
+        await self.execute(CREATE_EVENT_PROJECTION_STATE_SQL)
+        await self.execute(CREATE_EVENT_TIME_DETAILS_SQL)
+        await self.execute(CREATE_DANMAKU_EVENTS_SQL)
+        await self.execute(CREATE_ENTER_ROOM_EVENTS_SQL)
+        await self.execute(CREATE_GIFT_EVENTS_SQL)
+        await self.execute(CREATE_GUARD_EVENTS_SQL)
+        await self.execute(CREATE_SUPER_CHAT_EVENTS_SQL)
         await self.execute(CREATE_MONITOR_RUNS_SQL)
+        await self.execute(CREATE_ROOM_COLLECT_LEASES_SQL)
+        await self.ensure_column("collector_clients", "enabled", "TINYINT(1) NOT NULL DEFAULT 1 AFTER bili_sessdata")
+        await self.ensure_column("collector_clients", "max_active_rooms", "INT NOT NULL DEFAULT 50 AFTER enabled")
         await self.ensure_column("rooms", "current_session_id", "BIGINT NULL AFTER live_status")
         await self.ensure_column("room_events", "live_session_id", "BIGINT NULL AFTER event_key")
         await self.ensure_index("room_events", "idx_room_events_session_created", "KEY idx_room_events_session_created (live_session_id, created_at)")
         await self.ensure_column("monitor_runs", "configured_room_id", "BIGINT NULL AFTER room_id")
         await self.ensure_column("monitor_runs", "client_id", "VARCHAR(128) NULL AFTER configured_room_id")
         await self.ensure_column("monitor_runs", "last_heartbeat_at", "DATETIME NULL AFTER started_at")
+        await self.backfill_room_collect_leases()
         # 老数据可能曾经按 UTC 少存了 8 小时。这里用时间差条件保护，
         # 保证迁移可以重复执行，不会把已经正确的行再次平移。
         await self.execute(
@@ -194,6 +472,123 @@ class Database:
               AND TIMESTAMPDIFF(MINUTE, last_live_at, updated_at) BETWEEN 420 AND 540
             """
         )
+
+    async def touch_collector_client(self, client_id: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO collector_clients (client_id, bili_sessdata, last_seen_at)
+            VALUES (%s, '', CURRENT_TIMESTAMP)
+            ON DUPLICATE KEY UPDATE
+                last_seen_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (client_id,),
+        )
+
+    async def upsert_collector_client(
+        self,
+        *,
+        client_id: str,
+        bili_sessdata: Optional[str],
+        enabled: Optional[bool],
+        max_active_rooms: Optional[int],
+        remark: Optional[str],
+    ) -> Dict[str, Any]:
+        max_rooms = max(1, int(max_active_rooms or 50))
+        await self.execute(
+            """
+            INSERT INTO collector_clients (client_id, bili_sessdata, enabled, max_active_rooms, remark)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                bili_sessdata = CASE
+                    WHEN %s IS NULL THEN bili_sessdata
+                    ELSE VALUES(bili_sessdata)
+                END,
+                enabled = CASE
+                    WHEN %s IS NULL THEN enabled
+                    ELSE VALUES(enabled)
+                END,
+                max_active_rooms = CASE
+                    WHEN %s IS NULL THEN max_active_rooms
+                    ELSE VALUES(max_active_rooms)
+                END,
+                remark = VALUES(remark),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                client_id,
+                "" if bili_sessdata is None else bili_sessdata.strip(),
+                1 if enabled is None else int(enabled),
+                max_rooms,
+                remark or "",
+                bili_sessdata,
+                enabled,
+                max_active_rooms,
+            ),
+        )
+        client = await self.get_collector_client(client_id)
+        if client is None:
+            raise RuntimeError("failed to load collector client")
+        return client
+
+    async def get_collector_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        row = await self.fetch_one(
+            """
+            SELECT client_id, bili_sessdata, enabled, max_active_rooms, remark, last_seen_at, created_at, updated_at
+            FROM collector_clients
+            WHERE client_id = %s
+            """,
+            (client_id,),
+        )
+        return self._collector_client_public(row) if row else None
+
+    async def get_collector_client_sessdata(self, client_id: str) -> str:
+        row = await self.fetch_one(
+            "SELECT bili_sessdata FROM collector_clients WHERE client_id = %s",
+            (client_id,),
+        )
+        return str(row["bili_sessdata"] or "") if row else ""
+
+    async def get_collector_client_runtime_config(self, client_id: str) -> Dict[str, Any]:
+        row = await self.fetch_one(
+            """
+            SELECT bili_sessdata, enabled, max_active_rooms
+            FROM collector_clients
+            WHERE client_id = %s
+            """,
+            (client_id,),
+        )
+        if row is None:
+            return {"bili_sessdata": "", "enabled": True, "max_active_rooms": 50}
+        return {
+            "bili_sessdata": str(row.get("bili_sessdata") or ""),
+            "enabled": bool(row.get("enabled")),
+            "max_active_rooms": max(1, int(row.get("max_active_rooms") or 50)),
+        }
+
+    async def list_collector_clients(self) -> List[Dict[str, Any]]:
+        rows = await self.fetch_all(
+            """
+            SELECT client_id, bili_sessdata, enabled, max_active_rooms, remark, last_seen_at, created_at, updated_at
+            FROM collector_clients
+            ORDER BY COALESCE(last_seen_at, updated_at) DESC, client_id ASC
+            """
+        )
+        return [self._collector_client_public(row) for row in rows]
+
+    def _collector_client_public(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        value = str(row.get("bili_sessdata") or "")
+        return {
+            "client_id": row["client_id"],
+            "remark": row.get("remark") or "",
+            "enabled": bool(row.get("enabled")),
+            "max_active_rooms": max(1, int(row.get("max_active_rooms") or 50)),
+            "sessdata_configured": bool(value),
+            "sessdata_preview": mask_secret(value),
+            "last_seen_at": row.get("last_seen_at"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
 
     async def reclassify_unknown_events(self, batch_size: int = 1000) -> int:
         from .events import parse_event_or_error
@@ -278,12 +673,202 @@ class Database:
             return
         await self.execute(f"ALTER TABLE {table_name} ADD {ddl}")
 
+    @asynccontextmanager
+    async def named_lock(self, lock_name: str, timeout_seconds: int = 0) -> AsyncIterator[bool]:
+        if self._pool is None:
+            raise RuntimeError("database is not connected")
+        async with self._pool.acquire() as conn:
+            acquired = False
+            async with conn.cursor(aiomysql.DictCursor) as cursor:
+                await cursor.execute("SELECT GET_LOCK(%s, %s) AS acquired", (lock_name, timeout_seconds))
+                row = await cursor.fetchone()
+                acquired = bool(row and int(row["acquired"]) == 1)
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    async with conn.cursor() as cursor:
+                        await cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
+
+    async def get_projection_last_event_id(self, name: str) -> int:
+        await self.execute(
+            """
+            INSERT INTO event_projection_state (name, last_event_id)
+            VALUES (%s, 0)
+            ON DUPLICATE KEY UPDATE name = VALUES(name)
+            """,
+            (name,),
+        )
+        row = await self.fetch_one(
+            "SELECT last_event_id FROM event_projection_state WHERE name = %s",
+            (name,),
+        )
+        return int(row["last_event_id"]) if row else 0
+
+    async def update_projection_last_event_id(self, name: str, last_event_id: int) -> None:
+        await self.execute(
+            """
+            INSERT INTO event_projection_state (name, last_event_id)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE
+                last_event_id = GREATEST(last_event_id, VALUES(last_event_id)),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (name, last_event_id),
+        )
+
+    async def fetch_room_events_after(self, last_event_id: int, limit: int) -> List[Dict[str, Any]]:
+        return await self.fetch_all(
+            """
+            SELECT id,
+                   room_id,
+                   event_type,
+                   event_key,
+                   live_session_id,
+                   uid,
+                   username,
+                   content,
+                   raw_json,
+                   event_time,
+                   created_at
+            FROM room_events
+            WHERE id > %s
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (last_event_id, limit),
+        )
+
+    async def resolve_event_projection_context(
+        self,
+        *,
+        room_id: int,
+        event_at: datetime,
+        live_session_id: Optional[int],
+    ) -> Dict[str, Any]:
+        session = None
+        if live_session_id is not None:
+            session = await self.fetch_one(
+                """
+                SELECT id, configured_room_id, anchor_uid, started_at
+                FROM live_sessions
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (live_session_id,),
+            )
+        if session is None:
+            session = await self.fetch_one(
+                """
+                SELECT id, configured_room_id, anchor_uid, started_at
+                FROM live_sessions
+                WHERE room_id = %s
+                  AND started_at <= %s
+                  AND (ended_at IS NULL OR ended_at >= %s)
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+                """,
+                (room_id, event_at, event_at),
+            )
+        if session is not None:
+            return {
+                "live_session_id": session["id"],
+                "configured_room_id": session["configured_room_id"],
+                "anchor_uid": session["anchor_uid"],
+                "session_started_at": session["started_at"],
+            }
+
+        room = await self.fetch_one(
+            """
+            SELECT room_id AS configured_room_id, anchor_uid
+            FROM rooms
+            WHERE real_room_id = %s OR room_id = %s
+            ORDER BY CASE WHEN real_room_id = %s THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (room_id, room_id, room_id),
+        )
+        return {
+            "live_session_id": None,
+            "configured_room_id": room["configured_room_id"] if room else None,
+            "anchor_uid": room["anchor_uid"] if room else None,
+            "session_started_at": None,
+        }
+
+    async def upsert_event_time_detail(self, row: Dict[str, Any]) -> None:
+        await self.upsert_event_time_details([row])
+
+    async def upsert_event_time_details(self, rows: List[Dict[str, Any]]) -> None:
+        await self._upsert_projection_rows("event_time_details", rows)
+
+    async def upsert_analytic_event(self, table_name: str, row: Dict[str, Any]) -> None:
+        await self.upsert_analytic_events(table_name, [row])
+
+    async def upsert_analytic_events(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
+        if table_name not in ANALYTIC_EVENT_TABLES:
+            raise ValueError(f"unsupported analytic event table: {table_name}")
+        await self._upsert_projection_rows(table_name, rows)
+
+    async def _upsert_projection_rows(self, table_name: str, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        if table_name != "event_time_details" and table_name not in ANALYTIC_EVENT_TABLES:
+            raise ValueError(f"unsupported projection table: {table_name}")
+        row = rows[0]
+        columns = list(row.keys())
+        for current in rows:
+            if list(current.keys()) != columns:
+                raise ValueError(f"inconsistent projection columns for {table_name}")
+        placeholders = ", ".join(["%s"] * len(columns))
+        column_sql = ", ".join(f"`{column}`" for column in columns)
+        update_sql = ", ".join(f"`{column}` = VALUES(`{column}`)" for column in columns if column != "event_id")
+        await self.execute_many(
+            f"""
+            INSERT INTO {table_name} ({column_sql})
+            VALUES ({placeholders})
+            ON DUPLICATE KEY UPDATE {update_sql}
+            """,
+            [tuple(current[column] for column in columns) for current in rows],
+        )
+
+    async def backfill_room_collect_leases(self) -> None:
+        await self.execute(
+            """
+            INSERT INTO room_collect_leases
+                (room_id, configured_room_id, client_id, run_id, lease_expires_at, last_heartbeat_at)
+            SELECT room_id,
+                   configured_room_id,
+                   COALESCE(client_id, ''),
+                   id,
+                   DATE_ADD(CURRENT_TIMESTAMP, INTERVAL %s SECOND),
+                   COALESCE(last_heartbeat_at, started_at)
+            FROM monitor_runs
+            WHERE running = 1
+            ON DUPLICATE KEY UPDATE
+                configured_room_id = VALUES(configured_room_id),
+                client_id = VALUES(client_id),
+                run_id = VALUES(run_id),
+                lease_expires_at = VALUES(lease_expires_at),
+                last_heartbeat_at = VALUES(last_heartbeat_at),
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (self._settings.collector_stale_seconds,),
+        )
+
     async def execute(self, sql: str, params: Optional[Iterable[Any]] = None) -> int:
         if self._pool is None:
             raise RuntimeError("database is not connected")
         async with self._pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(sql, params)
+                return cursor.rowcount
+
+    async def execute_many(self, sql: str, params: Iterable[Iterable[Any]]) -> int:
+        if self._pool is None:
+            raise RuntimeError("database is not connected")
+        async with self._pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.executemany(sql, params)
                 return cursor.rowcount
 
     async def fetch_one(self, sql: str, params: Optional[Iterable[Any]] = None) -> Optional[Dict[str, Any]]:
@@ -532,8 +1117,8 @@ class Database:
         )
 
     async def insert_event(self, event: EventRecord) -> None:
-        # event_key 允许为空，因此 unknown/parse_error 会完整保留；
         # 已知业务事件使用唯一 key，避免重连或重复上报导致重复入库。
+        # 未知命令和解析失败会在解析层跳过，不进入这里。
         await self.execute(
             """
             INSERT INTO room_events
@@ -585,7 +1170,7 @@ class Database:
         limit: int,
         offset: int,
     ) -> List[Dict[str, Any]]:
-        filters: List[str] = []
+        filters: List[str] = ["event_type NOT IN ('unknown', 'parse_error')"]
         params: List[Any] = []
         if room_id is not None:
             filters.append("room_id = %s")
@@ -652,6 +1237,13 @@ class Database:
     async def reset_running_monitor_runs(self, reason: str = "api restarted") -> None:
         await self.execute(
             """
+            UPDATE room_collect_leases
+            SET lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            """
+        )
+        await self.execute(
+            """
             UPDATE monitor_runs
             SET running = 0,
                 stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP),
@@ -663,6 +1255,17 @@ class Database:
         )
 
     async def reset_stale_monitor_runs(self, stale_after_seconds: int) -> None:
+        await self.execute(
+            """
+            UPDATE room_collect_leases l
+            JOIN monitor_runs r ON r.id = l.run_id
+            SET l.lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                l.updated_at = CURRENT_TIMESTAMP
+            WHERE r.running = 1
+              AND TIMESTAMPDIFF(SECOND, COALESCE(r.last_heartbeat_at, r.started_at), CURRENT_TIMESTAMP) > %s
+            """,
+            (stale_after_seconds,),
+        )
         await self.execute(
             """
             UPDATE monitor_runs
@@ -685,6 +1288,21 @@ class Database:
             ORDER BY id DESC
             """
         )
+
+    async def active_monitor_room_ids_for_client(self, client_id: str) -> List[int]:
+        rows = await self.fetch_all(
+            """
+            SELECT DISTINCT l.room_id
+            FROM room_collect_leases l
+            JOIN monitor_runs r ON r.id = l.run_id
+            WHERE l.client_id = %s
+              AND l.lease_expires_at > CURRENT_TIMESTAMP
+              AND r.running = 1
+            ORDER BY l.room_id ASC
+            """,
+            (client_id,),
+        )
+        return [int(row["room_id"]) for row in rows]
 
     async def get_running_monitor_run(self, room_id: int) -> Optional[Dict[str, Any]]:
         return await self.fetch_one(
@@ -717,25 +1335,123 @@ class Database:
         client_id: str,
         stale_after_seconds: int,
     ) -> Optional[Dict[str, Any]]:
-        # 一个真实直播间只允许有一个活跃 run。同一个 client 会续租，
-        # 其他 client 需要等待；过期租约会先关闭再重新认领。
-        active = await self.get_running_monitor_run(room_id)
-        if active is not None:
-            active_client_id = str(active.get("client_id") or "")
-            heartbeat_age = int(active.get("heartbeat_age_seconds") or 0)
-            if active_client_id == client_id:
-                await self.heartbeat_monitor_run(int(active["id"]), client_id=client_id)
-                return await self.get_monitor_run(int(active["id"]))
-            if heartbeat_age <= stale_after_seconds:
-                return None
-            await self.finish_monitor_run(int(active["id"]), error_message="collector heartbeat timeout")
+        if self._pool is None:
+            raise RuntimeError("database is not connected")
 
-        run_id = await self.create_monitor_run(
-            room_id,
-            configured_room_id=configured_room_id,
-            client_id=client_id,
-        )
-        return await self.get_monitor_run(run_id)
+        claimed_run_id: Optional[int] = None
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor(aiomysql.DictCursor) as cursor:
+                    await cursor.execute(
+                        """
+                        INSERT INTO room_collect_leases
+                            (room_id, configured_room_id, client_id, run_id, lease_expires_at, last_heartbeat_at)
+                        VALUES (
+                            %s,
+                            %s,
+                            '',
+                            NULL,
+                            TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                            NULL
+                        )
+                        ON DUPLICATE KEY UPDATE room_id = room_id
+                        """,
+                        (room_id, configured_room_id),
+                    )
+                    await cursor.execute(
+                        """
+                        SELECT l.room_id,
+                               l.configured_room_id,
+                               l.client_id,
+                               l.run_id,
+                               l.lease_expires_at,
+                               CASE
+                                   WHEN l.lease_expires_at <= CURRENT_TIMESTAMP THEN 1
+                                   ELSE 0
+                               END AS lease_expired,
+                               r.running AS run_running
+                        FROM room_collect_leases l
+                        LEFT JOIN monitor_runs r ON r.id = l.run_id
+                        WHERE l.room_id = %s
+                        FOR UPDATE
+                        """,
+                        (room_id,),
+                    )
+                    lease = await cursor.fetchone()
+                    if lease is None:
+                        await conn.rollback()
+                        return None
+
+                    lease_client_id = str(lease.get("client_id") or "")
+                    lease_run_id = int(lease["run_id"]) if lease.get("run_id") is not None else None
+                    lease_expired = bool(int(lease.get("lease_expired") or 0))
+                    run_running = bool(int(lease.get("run_running") or 0))
+
+                    if lease_client_id == client_id and lease_run_id is not None and run_running:
+                        claimed_run_id = lease_run_id
+                        await cursor.execute(
+                            """
+                            UPDATE monitor_runs
+                            SET last_heartbeat_at = CURRENT_TIMESTAMP,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND running = 1
+                            """,
+                            (claimed_run_id, client_id),
+                        )
+                    else:
+                        owned_by_other = bool(lease_client_id) and lease_client_id != client_id
+                        if owned_by_other and lease_run_id is not None and run_running and not lease_expired:
+                            await conn.rollback()
+                            return None
+
+                        if lease_run_id is not None and (lease_expired or not run_running):
+                            await cursor.execute(
+                                """
+                                UPDATE monitor_runs
+                                SET running = 0,
+                                    stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP),
+                                    error_message = COALESCE(error_message, 'collector heartbeat timeout'),
+                                    updated_at = CURRENT_TIMESTAMP
+                                WHERE id = %s
+                                  AND running = 1
+                                """,
+                                (lease_run_id,),
+                            )
+
+                        await cursor.execute(
+                            """
+                            INSERT INTO monitor_runs
+                                (room_id, configured_room_id, client_id, running, started_at, last_heartbeat_at)
+                            VALUES (%s, %s, %s, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                            """,
+                            (room_id, configured_room_id, client_id),
+                        )
+                        claimed_run_id = int(cursor.lastrowid)
+
+                    await cursor.execute(
+                        """
+                        UPDATE room_collect_leases
+                        SET configured_room_id = %s,
+                            client_id = %s,
+                            run_id = %s,
+                            lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL %s SECOND),
+                            last_heartbeat_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE room_id = %s
+                        """,
+                        (configured_room_id, client_id, claimed_run_id, stale_after_seconds, room_id),
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+        if claimed_run_id is None:
+            return None
+        return await self.get_monitor_run(claimed_run_id)
 
     async def get_monitor_run(self, run_id: int) -> Optional[Dict[str, Any]]:
         return await self.fetch_one(
@@ -748,32 +1464,53 @@ class Database:
         )
 
     async def heartbeat_monitor_run(self, run_id: int, *, client_id: str) -> bool:
-        rowcount = await self.execute(
-            """
-            UPDATE monitor_runs
-            SET last_heartbeat_at = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-              AND client_id = %s
-              AND running = 1
-            """,
-            (run_id, client_id),
-        )
-        if rowcount > 0:
-            return True
-        row = await self.fetch_one(
-            """
-            SELECT id
-            FROM monitor_runs
-            WHERE id = %s
-              AND client_id = %s
-              AND running = 1
-            """,
-            (run_id, client_id),
-        )
-        return row is not None
+        if self._pool is None:
+            raise RuntimeError("database is not connected")
+        async with self._pool.acquire() as conn:
+            await conn.begin()
+            try:
+                async with conn.cursor() as cursor:
+                    rowcount = await cursor.execute(
+                        """
+                        UPDATE monitor_runs
+                        SET last_heartbeat_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND running = 1
+                        """,
+                        (run_id, client_id),
+                    )
+                    if rowcount <= 0:
+                        await conn.rollback()
+                        return False
+                    await cursor.execute(
+                        """
+                        UPDATE room_collect_leases
+                        SET lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL %s SECOND),
+                            last_heartbeat_at = CURRENT_TIMESTAMP,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE run_id = %s
+                          AND client_id = %s
+                        """,
+                        (self._settings.collector_stale_seconds, run_id, client_id),
+                    )
+                await conn.commit()
+                return True
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def finish_running_room_runs(self, room_id: int, reason: str) -> None:
+        await self.execute(
+            """
+            UPDATE room_collect_leases
+            SET lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE room_id = %s
+            """,
+            (room_id,),
+        )
         await self.execute(
             """
             UPDATE monitor_runs
@@ -788,6 +1525,15 @@ class Database:
         )
 
     async def finish_monitor_run(self, run_id: int, *, error_message: Optional[str] = None) -> None:
+        await self.execute(
+            """
+            UPDATE room_collect_leases
+            SET lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE run_id = %s
+            """,
+            (run_id,),
+        )
         await self.execute(
             """
             UPDATE monitor_runs
@@ -820,6 +1566,17 @@ class Database:
             """,
             (error_message, run_id, client_id),
         )
+        if rowcount > 0:
+            await self.execute(
+                """
+                UPDATE room_collect_leases
+                SET lease_expires_at = TIMESTAMPADD(SECOND, -1, CURRENT_TIMESTAMP),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE run_id = %s
+                  AND client_id = %s
+                """,
+                (run_id, client_id),
+            )
         return rowcount > 0
 
     async def recent_monitor_runs(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -845,10 +1602,12 @@ class Database:
     async def active_monitor_room_ids(self) -> List[int]:
         rows = await self.fetch_all(
             """
-            SELECT DISTINCT room_id
-            FROM monitor_runs
-            WHERE running = 1
-            ORDER BY room_id ASC
+            SELECT DISTINCT l.room_id
+            FROM room_collect_leases l
+            JOIN monitor_runs r ON r.id = l.run_id
+            WHERE r.running = 1
+              AND l.lease_expires_at > CURRENT_TIMESTAMP
+            ORDER BY l.room_id ASC
             """
         )
         return [int(row["room_id"]) for row in rows]

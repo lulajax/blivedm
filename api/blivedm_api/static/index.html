@@ -16,35 +16,88 @@
     </header>
 
     <main class="layout">
-      <section class="panel room-panel">
-        <div class="panel-head">
-          <h2>监控房间</h2>
-          <span id="statusText">加载中</span>
-        </div>
+      <div class="left-column">
+        <section class="panel room-panel">
+          <div class="panel-head">
+            <h2>监控房间</h2>
+            <span id="statusText">加载中</span>
+          </div>
 
-        <form id="roomForm" class="room-form">
-          <input id="roomInput" name="room" autocomplete="off" placeholder="直播间 URL 或房间号" required />
-          <input id="remarkInput" name="remark" autocomplete="off" placeholder="备注" />
-          <button type="submit">添加</button>
-        </form>
+          <form id="roomForm" class="room-form">
+            <input id="roomInput" name="room" autocomplete="off" placeholder="直播间 URL 或房间号" required />
+            <input id="remarkInput" name="remark" autocomplete="off" placeholder="备注" />
+            <button type="submit">添加</button>
+          </form>
 
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>房间</th>
-                <th>标题</th>
-                <th>状态</th>
-                <th>监听</th>
-                <th>场次</th>
-                <th>备注</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody id="roomsBody"></tbody>
-          </table>
-        </div>
-      </section>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>房间</th>
+                  <th>标题</th>
+                  <th>状态</th>
+                  <th>监听</th>
+                  <th>场次</th>
+                  <th>备注</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="roomsBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel client-panel">
+          <div class="panel-head">
+            <h2>采集客户端 Cookie</h2>
+            <span class="muted">按 client_id 独立配置</span>
+          </div>
+
+          <form id="collectorClientForm" class="client-form">
+            <input id="collectorClientIdInput" name="client_id" autocomplete="off" placeholder="client_id" required />
+            <input id="collectorClientRemarkInput" name="remark" autocomplete="off" placeholder="备注" />
+            <input
+              id="collectorMaxRoomsInput"
+              name="max_active_rooms"
+              type="number"
+              min="1"
+              max="500"
+              step="1"
+              value="50"
+              placeholder="最大房间数"
+            />
+            <input
+              id="collectorSessdataInput"
+              name="bili_sessdata"
+              type="password"
+              autocomplete="off"
+              placeholder="SESSDATA 或 Cookie 片段，留空只更新备注"
+            />
+            <label class="checkbox-field">
+              <input id="collectorEnabledInput" name="enabled" type="checkbox" checked />
+              启用
+            </label>
+            <button type="submit">保存</button>
+          </form>
+
+          <div class="table-wrap client-table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>客户端</th>
+                  <th>状态</th>
+                  <th>最大房间数</th>
+                  <th>SESSDATA</th>
+                  <th>最近拉取任务</th>
+                  <th>备注</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="collectorClientsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
 
       <section class="panel event-panel">
         <div class="panel-head">
@@ -58,8 +111,6 @@
               <option value="gift">礼物</option>
               <option value="guard">上舰</option>
               <option value="super_chat">醒目留言</option>
-              <option value="unknown">未知</option>
-              <option value="parse_error">解析错误</option>
             </select>
           </div>
         </div>

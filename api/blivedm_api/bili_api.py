@@ -35,12 +35,30 @@ class BiliCollectConfig:
 
 def apply_bili_cookie(session: aiohttp.ClientSession, sessdata: str) -> None:
     # SESSDATA 可选；配置后会随 B 站 HTTP 请求发送，用于更稳定地获取房间信息。
-    if not sessdata:
+    normalized = normalize_sessdata(sessdata)
+    if not normalized:
         return
     cookies = http.cookies.SimpleCookie()
-    cookies["SESSDATA"] = sessdata
+    cookies["SESSDATA"] = normalized
     cookies["SESSDATA"]["domain"] = "bilibili.com"
     session.cookie_jar.update_cookies(cookies)
+
+
+def normalize_sessdata(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    try:
+        parsed = http.cookies.SimpleCookie()
+        parsed.load(text)
+    except http.cookies.CookieError:
+        return text
+
+    for key, morsel in parsed.items():
+        if key.upper() == "SESSDATA":
+            return str(morsel.value or "").strip()
+    return text
 
 
 def parse_bili_live_time(value: Any) -> Optional[datetime]:

@@ -11,6 +11,7 @@ from blivedm_api.events import (
     enter_room_event_key,
     event_time_from_seconds,
     event_from_command,
+    parse_event_or_error,
     stable_event_key,
 )
 
@@ -95,6 +96,18 @@ def test_interact_word_non_enter_is_ignored():
             },
         ),
     )
+
+    assert event is None
+
+
+def test_unknown_command_is_not_persisted():
+    event = event_from_command(1, command("NEW_NOISE_COMMAND", {"uid": 42}))
+
+    assert event is None
+
+
+def test_parse_error_is_not_persisted():
+    event = parse_event_or_error(1, {"cmd": "DANMU_MSG", "info": {}})
 
     assert event is None
 

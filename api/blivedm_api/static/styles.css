@@ -111,6 +111,13 @@ select:focus {
   padding: 18px;
 }
 
+.left-column {
+  display: grid;
+  align-content: start;
+  gap: 18px;
+  min-width: 0;
+}
+
 .panel {
   min-width: 0;
   border: 1px solid var(--line);
@@ -148,8 +155,37 @@ select:focus {
   border-bottom: 1px solid var(--line);
 }
 
+.client-form {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(120px, 180px) minmax(96px, 120px) minmax(220px, 1.1fr) auto auto;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.checkbox-field {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.checkbox-field input {
+  min-height: auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
 .table-wrap {
   overflow: auto;
+}
+
+.client-table-wrap {
+  max-height: 260px;
 }
 
 table {
@@ -213,6 +249,14 @@ td {
 
 .session-cell {
   min-width: 138px;
+}
+
+.secret-cell {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 118px;
 }
 
 .badge {
@@ -340,6 +384,19 @@ td {
   overflow-wrap: anywhere;
 }
 
+.gift-value {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  border-radius: 4px;
+  background: #fff4cf;
+  color: #8a5a00;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
 .danmaku-emote {
   display: inline-block;
   width: auto;
@@ -372,6 +429,10 @@ td {
   }
 
   .room-form {
+    grid-template-columns: 1fr;
+  }
+
+  .client-form {
     grid-template-columns: 1fr;
   }
 

@@ -37,7 +37,6 @@ class RoomCoordinator:
         if self.is_running:
             return
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-        apply_bili_cookie(self._session, self._settings.bili_sessdata)
         self._stopping = False
         self._task = asyncio.create_task(self._loop(), name="room-coordinator-loop")
 
@@ -148,45 +147,61 @@ class RoomCoordinator:
         if self._session is None:
             raise RuntimeError("coordinator session is not initialized")
 
+        await self._db.touch_collector_client(client_id)
+        client_config = await self._db.get_collector_client_runtime_config(client_id)
+        if not client_config["enabled"]:
+            return []
+        client_sessdata = str(client_config["bili_sessdata"] or "")
+        max_active_rooms = max(1, int(client_config["max_active_rooms"] or 50))
+        effective_limit = min(limit, max_active_rooms)
         # 任务认领是按需触发的：先刷新所有 enabled 房间的直播状态，
         # 再只使用本轮成功确认 live_status=1 的房间生成任务，避免旧缓存误下发。
         live_rooms = await self.poll_once()
+        owned_room_ids = set(await self._db.active_monitor_room_ids_for_client(client_id))
+        live_rooms.sort(
+            key=lambda item: (
+                0 if int(item.get("real_room_id") or item["room_id"]) in owned_room_ids else 1,
+                int(item["room_id"]),
+            )
+        )
         tasks: List[Dict[str, Any]] = []
-        for room in live_rooms:
-            if len(tasks) >= limit:
-                break
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as collect_session:
+            apply_bili_cookie(collect_session, client_sessdata)
+            for room in live_rooms:
+                if len(tasks) >= effective_limit:
+                    break
 
-            configured_room_id = int(room["room_id"])
-            real_room_id = int(room.get("real_room_id") or configured_room_id)
-            run = await self._db.claim_monitor_run(
-                real_room_id,
-                configured_room_id=configured_room_id,
-                client_id=client_id,
-                stale_after_seconds=self._settings.collector_stale_seconds,
-            )
-            if run is None:
-                continue
+                configured_room_id = int(room["room_id"])
+                real_room_id = int(room.get("real_room_id") or configured_room_id)
+                run = await self._db.claim_monitor_run(
+                    real_room_id,
+                    configured_room_id=configured_room_id,
+                    client_id=client_id,
+                    stale_after_seconds=self._settings.collector_stale_seconds,
+                )
+                if run is None:
+                    continue
 
-            try:
-                config = await fetch_collect_config(self._session, real_room_id)
-            except Exception as exc:  # noqa: BLE001
-                await self._db.finish_monitor_run(int(run["id"]), error_message=f"collect config failed: {exc}")
-                logger.warning("failed to create collect config room=%s client=%s: %s", real_room_id, client_id, exc)
-                continue
-            tasks.append(
-                {
-                    "run_id": int(run["id"]),
-                    "room_id": config.room_id,
-                    "configured_room_id": configured_room_id,
-                    "room_title": str(room.get("room_title") or ""),
-                    "anchor_uid": config.anchor_uid,
-                    "uid": config.uid,
-                    "buvid": config.buvid,
-                    "token": config.token,
-                    "host_list": config.host_list,
-                    "heartbeat_interval": self._settings.bilibili_heartbeat_interval_seconds,
-                    "issued_at": datetime.now().isoformat(timespec="seconds"),
-                }
-            )
+                try:
+                    config = await fetch_collect_config(collect_session, real_room_id)
+                except Exception as exc:  # noqa: BLE001
+                    await self._db.finish_monitor_run(int(run["id"]), error_message=f"collect config failed: {exc}")
+                    logger.warning("failed to create collect config room=%s client=%s: %s", real_room_id, client_id, exc)
+                    continue
+                tasks.append(
+                    {
+                        "run_id": int(run["id"]),
+                        "room_id": config.room_id,
+                        "configured_room_id": configured_room_id,
+                        "room_title": str(room.get("room_title") or ""),
+                        "anchor_uid": config.anchor_uid,
+                        "uid": config.uid,
+                        "buvid": config.buvid,
+                        "token": config.token,
+                        "host_list": config.host_list,
+                        "heartbeat_interval": self._settings.bilibili_heartbeat_interval_seconds,
+                        "issued_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                )
 
         return tasks

@@ -5,6 +5,13 @@ const toast = document.querySelector("#toast");
 const roomForm = document.querySelector("#roomForm");
 const roomInput = document.querySelector("#roomInput");
 const remarkInput = document.querySelector("#remarkInput");
+const collectorClientForm = document.querySelector("#collectorClientForm");
+const collectorClientsBody = document.querySelector("#collectorClientsBody");
+const collectorClientIdInput = document.querySelector("#collectorClientIdInput");
+const collectorClientRemarkInput = document.querySelector("#collectorClientRemarkInput");
+const collectorMaxRoomsInput = document.querySelector("#collectorMaxRoomsInput");
+const collectorEnabledInput = document.querySelector("#collectorEnabledInput");
+const collectorSessdataInput = document.querySelector("#collectorSessdataInput");
 const refreshBtn = document.querySelector("#refreshBtn");
 const eventRoomFilter = document.querySelector("#eventRoomFilter");
 const eventTypeFilter = document.querySelector("#eventTypeFilter");
@@ -35,8 +42,6 @@ const EVENT_TYPE_LABELS = {
   voice_join: "连麦列表",
   voice_join_count: "连麦人数",
   gift_combo: "礼物连击",
-  unknown: "未知",
-  parse_error: "解析错误",
 };
 
 function escapeHtml(value) {
@@ -93,6 +98,61 @@ function parseJson(value) {
   } catch {
     return null;
   }
+}
+
+function firstPositiveNumber(...values) {
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0) {
+      return number;
+    }
+  }
+  return 0;
+}
+
+function formatCompactNumber(value) {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+}
+
+function giftCoinLabel(value) {
+  const type = String(value || "").toLowerCase();
+  if (type === "gold") return "金瓜子";
+  if (type === "silver") return "银瓜子";
+  return value || "瓜子";
+}
+
+function extractGiftValue(event) {
+  if (event.event_type !== "gift") return null;
+  const raw = parseJson(event.raw_json);
+  const data = raw?.data || {};
+  const num = firstPositiveNumber(
+    data.num,
+    data.gift_num,
+    data.giftNum,
+    data.combo_send?.gift_num,
+    data.batch_combo_send?.gift_num
+  );
+  const unitPrice = firstPositiveNumber(data.discount_price, data.price);
+  const totalCoin = firstPositiveNumber(data.total_coin, data.totalCoin, unitPrice && num ? unitPrice * num : 0);
+  if (!totalCoin) return null;
+
+  const label = giftCoinLabel(data.coin_type || data.coinType);
+  const title = unitPrice && num ? `单价 ${formatCompactNumber(unitPrice)} ${label} x ${formatCompactNumber(num)}` : "";
+  return {
+    label,
+    title,
+    totalCoin,
+  };
+}
+
+function renderGiftValue(event) {
+  const value = extractGiftValue(event);
+  if (!value) return "";
+  return `
+    <span class="gift-value" title="${escapeHtml(value.title)}">
+      价值 ${escapeHtml(formatCompactNumber(value.totalCoin))} ${escapeHtml(value.label)}
+    </span>
+  `;
 }
 
 function safeImageUrl(value) {
@@ -268,8 +328,9 @@ function renderUserBadges(event) {
 function renderEventContent(event) {
   const text = escapeHtml(event.content || "");
   const emotes = extractDanmakuEmotes(event);
+  const giftValue = renderGiftValue(event);
   if (!emotes.length) {
-    return `<span class="event-text">${text}</span>`;
+    return `<span class="event-text">${text}</span>${giftValue}`;
   }
   const imageHtml = emotes
     .map(
@@ -285,7 +346,7 @@ function renderEventContent(event) {
       `
     )
     .join("");
-  return `<span class="event-text">${text}</span>${imageHtml}`;
+  return `<span class="event-text">${text}</span>${imageHtml}${giftValue}`;
 }
 
 function statusBadge(room) {
@@ -312,6 +373,18 @@ function sessionCell(room) {
     <div class="session-cell">
       <strong>#${escapeHtml(room.current_session_id)}</strong>
       <div class="muted">${escapeHtml(formatTime(room.current_session_started_at))}</div>
+    </div>
+  `;
+}
+
+function sessdataCell(client) {
+  if (!client.sessdata_configured) {
+    return '<span class="badge off">未配置</span>';
+  }
+  return `
+    <div class="secret-cell">
+      <span class="badge on">已配置</span>
+      <span class="muted">${escapeHtml(client.sessdata_preview || "")}</span>
     </div>
   `;
 }
@@ -344,6 +417,55 @@ function renderRooms(rooms) {
             <div class="actions">
               <button class="secondary" data-action="toggle" data-id="${room.id}" data-enabled="${room.enabled ? "0" : "1"}">${enabledText}</button>
               <button class="danger" data-action="delete" data-id="${room.id}">删除</button>
+            </div>
+          </td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
+function renderCollectorClients(clients) {
+  if (!clients.length) {
+    collectorClientsBody.innerHTML = '<tr><td colspan="7">暂无客户端</td></tr>';
+    return;
+  }
+
+  collectorClientsBody.innerHTML = clients
+    .map((client) => {
+      const clientId = escapeHtml(client.client_id);
+      const remark = escapeHtml(client.remark || "");
+      const enabled = client.enabled !== false;
+      const maxActiveRooms = Number(client.max_active_rooms || 50);
+      return `
+        <tr>
+          <td>
+            <strong>${clientId}</strong>
+            <div class="muted">创建 ${escapeHtml(formatTime(client.created_at))}</div>
+          </td>
+          <td>${enabled ? '<span class="badge on">启用</span>' : '<span class="badge off">停用</span>'}</td>
+          <td>${Number.isFinite(maxActiveRooms) ? maxActiveRooms : 50}</td>
+          <td>${sessdataCell(client)}</td>
+          <td>${escapeHtml(formatTime(client.last_seen_at))}</td>
+          <td>${remark || "-"}</td>
+          <td>
+            <div class="actions">
+              <button
+                class="secondary"
+                data-action="edit-client"
+                data-client-id="${clientId}"
+                data-remark="${remark}"
+                data-enabled="${enabled ? "1" : "0"}"
+                data-max-active-rooms="${Number.isFinite(maxActiveRooms) ? maxActiveRooms : 50}"
+              >编辑</button>
+              <button
+                class="danger"
+                data-action="clear-client-cookie"
+                data-client-id="${clientId}"
+                data-remark="${remark}"
+                data-enabled="${enabled ? "1" : "0"}"
+                data-max-active-rooms="${Number.isFinite(maxActiveRooms) ? maxActiveRooms : 50}"
+              >清空Cookie</button>
             </div>
           </td>
         </tr>
@@ -406,6 +528,12 @@ async function loadRooms() {
   const payload = await requestJson("/api/rooms");
   renderRooms(payload.items);
   return payload.items;
+}
+
+async function loadCollectorClients() {
+  const payload = await requestJson("/api/collector-clients");
+  renderCollectorClients(payload.items || []);
+  return payload.items || [];
 }
 
 function currentEventFilters() {
@@ -495,6 +623,7 @@ async function refreshAll({ resetEvents = true } = {}) {
   try {
     await Promise.all([
       loadRooms(),
+      loadCollectorClients(),
       resetEvents ? loadEvents({ reset: true }) : Promise.resolve(),
       loadStatus(),
     ]);
@@ -518,6 +647,74 @@ roomForm.addEventListener("submit", async (event) => {
     remarkInput.value = "";
     showToast("房间已添加");
     await refreshAll();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+collectorClientForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const clientId = collectorClientIdInput.value.trim();
+  const sessdata = collectorSessdataInput.value.trim();
+  if (!clientId) {
+    showToast("client_id 不能为空");
+    return;
+  }
+  const body = {
+    client_id: clientId,
+    remark: collectorClientRemarkInput.value.trim(),
+    enabled: collectorEnabledInput.checked,
+    max_active_rooms: Math.max(1, Number.parseInt(collectorMaxRoomsInput.value || "50", 10)),
+  };
+  if (sessdata) {
+    body.bili_sessdata = sessdata;
+  }
+
+  try {
+    await requestJson("/api/collector-clients", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    collectorSessdataInput.value = "";
+    showToast("客户端配置已保存");
+    await loadCollectorClients();
+  } catch (error) {
+    showToast(error.message);
+  }
+});
+
+collectorClientsBody.addEventListener("click", async (event) => {
+  const target = event.target.closest("button");
+  if (!target) return;
+  const clientId = target.dataset.clientId || "";
+  const remark = target.dataset.remark || "";
+  const enabled = target.dataset.enabled !== "0";
+  const maxActiveRooms = target.dataset.maxActiveRooms || "50";
+
+  if (target.dataset.action === "edit-client") {
+    collectorClientIdInput.value = clientId;
+    collectorClientRemarkInput.value = remark;
+    collectorEnabledInput.checked = enabled;
+    collectorMaxRoomsInput.value = maxActiveRooms;
+    collectorSessdataInput.value = "";
+    collectorSessdataInput.focus();
+    return;
+  }
+
+  if (target.dataset.action !== "clear-client-cookie") return;
+  try {
+    await requestJson("/api/collector-clients", {
+      method: "POST",
+      body: JSON.stringify({
+        client_id: clientId,
+        remark,
+        enabled,
+        max_active_rooms: Math.max(1, Number.parseInt(maxActiveRooms || "50", 10)),
+        bili_sessdata: "",
+      }),
+    });
+    showToast("客户端 Cookie 已清空");
+    await loadCollectorClients();
   } catch (error) {
     showToast(error.message);
   }

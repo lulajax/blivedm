@@ -405,8 +405,8 @@ def generic_known_event(room_id: int, command: Dict[str, Any], event_type: str, 
 
 
 def event_from_command(room_id: int, command: Dict[str, Any]) -> Optional[EventRecord]:
-    # 这里聚焦管理页需要查询的业务事件。非噪声的未知命令仍会以
-    # unknown 保存，便于后续观察是否需要新增解析规则。
+    # 这里只保留管理页需要查询的已知业务事件。未知命令直接忽略，
+    # 避免高频协议噪声进入数据库和筛选列表。
     cmd = normalize_cmd(command)
 
     if cmd == "_HEARTBEAT" or cmd in IGNORED_COMMANDS:
@@ -500,16 +500,7 @@ def event_from_command(room_id: int, command: Dict[str, Any]) -> Optional[EventR
             event_time=event_time_from_seconds(message.start_time),
         )
 
-    return EventRecord(
-        room_id=room_id,
-        event_type="unknown",
-        event_key=None,
-        uid=None,
-        username="",
-        content=cmd,
-        raw=command,
-        event_time=None,
-    )
+    return None
 
 
 def parse_event_or_error(room_id: int, command: Dict[str, Any]) -> Optional[EventRecord]:
@@ -518,13 +509,4 @@ def parse_event_or_error(room_id: int, command: Dict[str, Any]) -> Optional[Even
         return event_from_command(room_id, command)
     except Exception as exc:  # noqa: BLE001
         logger.exception("failed to parse room=%s cmd=%s", room_id, cmd)
-        return EventRecord(
-            room_id=room_id,
-            event_type="parse_error",
-            event_key=None,
-            uid=None,
-            username="",
-            content=f"{cmd}: {exc}",
-            raw=command,
-            event_time=None,
-        )
+        return None

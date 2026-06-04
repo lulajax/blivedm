@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .bili_api import normalize_sessdata
 from .config import Settings
 from .coordinator import RoomCoordinator
 from .db import Database
@@ -51,6 +52,14 @@ class EventBatchPayload(BaseModel):
 class CollectorRunPayload(BaseModel):
     client_id: str = Field(..., min_length=1, max_length=128)
     reason: Optional[str] = None
+
+
+class CollectorClientUpsert(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=128)
+    bili_sessdata: Optional[str] = None
+    enabled: Optional[bool] = None
+    max_active_rooms: Optional[int] = Field(None, ge=1, le=500)
+    remark: str = ""
 
 
 def parse_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -213,6 +222,30 @@ async def list_live_sessions(
         "items": items,
         "has_more": len(sessions) > limit,
     }
+
+
+@app.get("/api/collector-clients")
+async def list_collector_clients(request: Request):
+    return {"items": await get_db(request).list_collector_clients()}
+
+
+@app.post("/api/collector-clients")
+async def upsert_collector_client(payload: CollectorClientUpsert, request: Request):
+    client_id = payload.client_id.strip()
+    if not client_id:
+        raise HTTPException(status_code=400, detail="client_id is required")
+    bili_sessdata = None
+    if payload.bili_sessdata is not None:
+        bili_sessdata = normalize_sessdata(payload.bili_sessdata)
+    client = await get_db(request).upsert_collector_client(
+        client_id=client_id,
+        bili_sessdata=bili_sessdata,
+        enabled=payload.enabled,
+        max_active_rooms=payload.max_active_rooms,
+        remark=payload.remark,
+    )
+    get_coordinator(request).wake()
+    return client
 
 
 @app.post("/internal/events/batch")
