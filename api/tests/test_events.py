@@ -83,7 +83,11 @@ def test_interact_word_enter_room_is_parsed_as_enter_room():
     assert event.content == "进入房间"
 
 
-def test_interact_word_non_enter_is_ignored():
+@pytest.mark.parametrize(
+    "msg_type, content",
+    [(2, "关注主播"), (4, "特别关注主播")],
+)
+def test_interact_word_follow_is_parsed_as_follow(msg_type: int, content: str):
     event = event_from_command(
         1,
         command(
@@ -92,7 +96,30 @@ def test_interact_word_non_enter_is_ignored():
                 "uid": 42,
                 "uname": "alice",
                 "timestamp": 1710000000,
-                "msg_type": 2,
+                "msg_type": msg_type,
+            },
+        ),
+    )
+
+    assert event is not None
+    assert event.event_type == "follow"
+    assert event.event_key == "follow:1710000000:42"
+    assert event.uid == 42
+    assert event.username == "alice"
+    assert event.content == content
+
+
+@pytest.mark.parametrize("msg_type", [3, 5, 6])
+def test_interact_word_other_interaction_is_ignored(msg_type: int):
+    event = event_from_command(
+        1,
+        command(
+            "INTERACT_WORD",
+            {
+                "uid": 42,
+                "uname": "alice",
+                "timestamp": 1710000000,
+                "msg_type": msg_type,
             },
         ),
     )

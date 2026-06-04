@@ -293,9 +293,14 @@ def interact_word_event(room_id: int, command: Dict[str, Any]) -> EventRecord:
     timestamp = common_timestamp(data)
     event_time = event_time_from_unix(timestamp)
     label = INTERACT_WORD_LABELS.get(msg_type, content_from_common(data, "互动消息"))
-    event_type = "enter_room" if msg_type == 1 else "interact_word"
-    if event_type == "enter_room" and timestamp and uid:
-        event_key = stable_event_key("enter_room", timestamp, uid)
+    if msg_type in (2, 4):
+        event_type = "follow"
+    elif msg_type == 1:
+        event_type = "enter_room"
+    else:
+        event_type = "interact_word"
+    if event_type in ("enter_room", "follow") and timestamp and uid:
+        event_key = stable_event_key(event_type, timestamp, uid)
     else:
         event_key = generic_command_event_key(event_type, command, data, uid)
     return EventRecord(
@@ -427,21 +432,26 @@ def event_from_command(room_id: int, command: Dict[str, Any]) -> Optional[EventR
 
     if cmd == "INTERACT_WORD":
         event = interact_word_event(room_id, command)
-        return event if event.event_type == "enter_room" else None
+        return event if event.event_type in ("enter_room", "follow") else None
 
     if cmd == "INTERACT_WORD_V2":
         message = web_models.InteractWordV2Message.from_command(command["data"])
-        # msg_type=1 表示用户进入直播间；其他 interaction word 多是展示效果
-        # 或无关互动提示，暂不作为业务事件入库。
-        if message.msg_type != 1:
+        # msg_type=1 进入房间；msg_type=2/4 关注/特别关注主播。其他 interaction
+        # word 多是展示效果或无关互动提示，暂不作为业务事件入库。
+        if message.msg_type == 1:
+            event_type, content = "enter_room", "进入房间"
+        elif message.msg_type in (2, 4):
+            event_type = "follow"
+            content = INTERACT_WORD_LABELS.get(message.msg_type, "关注主播")
+        else:
             return None
         return EventRecord(
             room_id=room_id,
-            event_type="enter_room",
-            event_key=enter_room_event_key(message),
+            event_type=event_type,
+            event_key=stable_event_key(event_type, message.timestamp, message.uid),
             uid=message.uid,
             username=message.username,
-            content="进入房间",
+            content=content,
             raw=command,
             event_time=event_time_from_seconds(message.timestamp),
         )

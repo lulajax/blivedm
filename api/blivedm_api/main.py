@@ -224,6 +224,22 @@ async def list_live_sessions(
     }
 
 
+@app.get("/api/analytics/overview")
+async def analytics_overview(
+    request: Request,
+    room_id: Optional[int] = None,
+    live_session_id: Optional[int] = Query(None, ge=1),
+    minutes: int = Query(60, ge=10, le=24 * 60),
+    bucket_minutes: int = Query(10, ge=1, le=60),
+):
+    return await get_db(request).analytics_overview(
+        room_id=room_id,
+        live_session_id=live_session_id,
+        minutes=minutes,
+        bucket_minutes=bucket_minutes,
+    )
+
+
 @app.get("/api/collector-clients")
 async def list_collector_clients(request: Request):
     return {"items": await get_db(request).list_collector_clients()}

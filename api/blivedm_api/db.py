@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Dict, Iterable, List, Optional
 
 import aiomysql
@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS room_events (
     UNIQUE KEY uniq_room_event_key (room_id, event_type, event_key),
     KEY idx_room_events_session_created (live_session_id, created_at),
     KEY idx_room_events_room_created (room_id, created_at),
-    KEY idx_room_events_type_created (event_type, created_at)
+    KEY idx_room_events_type_created (event_type, created_at),
+    KEY idx_room_events_room_id (room_id, id),
+    KEY idx_room_events_type_id (event_type, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -200,6 +202,34 @@ CREATE TABLE IF NOT EXISTS enter_room_events (
     KEY idx_enter_room_events_session_time (live_session_id, event_at),
     KEY idx_enter_room_events_uid_time (uid, event_at),
     KEY idx_enter_room_events_anchor_time (anchor_uid, event_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+CREATE_FOLLOW_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS follow_events (
+    event_id BIGINT NOT NULL,
+    room_id BIGINT NOT NULL,
+    configured_room_id BIGINT NULL,
+    live_session_id BIGINT NULL,
+    anchor_uid BIGINT NULL,
+    uid BIGINT NULL,
+    username VARCHAR(255) NOT NULL DEFAULT '',
+    event_at DATETIME NOT NULL,
+    created_at DATETIME NOT NULL,
+    source_cmd VARCHAR(80) NOT NULL DEFAULT '',
+    action_text VARCHAR(255) NOT NULL DEFAULT '',
+    user_level INT NULL,
+    wealth_level INT NULL,
+    medal_name VARCHAR(255) NOT NULL DEFAULT '',
+    medal_level INT NULL,
+    medal_anchor_uid BIGINT NULL,
+    guard_level INT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (event_id),
+    KEY idx_follow_events_room_time (room_id, event_at),
+    KEY idx_follow_events_session_time (live_session_id, event_at),
+    KEY idx_follow_events_uid_time (uid, event_at),
+    KEY idx_follow_events_anchor_time (anchor_uid, event_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -369,6 +399,7 @@ ANALYTIC_EVENT_TABLES = frozenset(
     {
         "danmaku_events",
         "enter_room_events",
+        "follow_events",
         "gift_events",
         "guard_events",
         "super_chat_events",
@@ -410,6 +441,7 @@ class Database:
         await self.execute(CREATE_EVENT_TIME_DETAILS_SQL)
         await self.execute(CREATE_DANMAKU_EVENTS_SQL)
         await self.execute(CREATE_ENTER_ROOM_EVENTS_SQL)
+        await self.execute(CREATE_FOLLOW_EVENTS_SQL)
         await self.execute(CREATE_GIFT_EVENTS_SQL)
         await self.execute(CREATE_GUARD_EVENTS_SQL)
         await self.execute(CREATE_SUPER_CHAT_EVENTS_SQL)
@@ -420,6 +452,8 @@ class Database:
         await self.ensure_column("rooms", "current_session_id", "BIGINT NULL AFTER live_status")
         await self.ensure_column("room_events", "live_session_id", "BIGINT NULL AFTER event_key")
         await self.ensure_index("room_events", "idx_room_events_session_created", "KEY idx_room_events_session_created (live_session_id, created_at)")
+        await self.ensure_index("room_events", "idx_room_events_room_id", "KEY idx_room_events_room_id (room_id, id)")
+        await self.ensure_index("room_events", "idx_room_events_type_id", "KEY idx_room_events_type_id (event_type, id)")
         await self.ensure_column("monitor_runs", "configured_room_id", "BIGINT NULL AFTER room_id")
         await self.ensure_column("monitor_runs", "client_id", "VARCHAR(128) NULL AFTER configured_room_id")
         await self.ensure_column("monitor_runs", "last_heartbeat_at", "DATETIME NULL AFTER started_at")
@@ -1212,6 +1246,228 @@ class Database:
             """,
             params,
         )
+
+    async def analytics_overview(
+        self,
+        *,
+        room_id: Optional[int],
+        live_session_id: Optional[int],
+        minutes: int,
+        bucket_minutes: int,
+    ) -> Dict[str, Any]:
+        filters: List[str] = []
+        params: List[Any] = []
+        session_row = None
+        if live_session_id is not None:
+            session_row = await self.get_live_session(live_session_id)
+            filters.append("live_session_id = %s")
+            params.append(live_session_id)
+        if room_id is not None:
+            filters.append("room_id = %s")
+            params.append(room_id)
+        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        latest = await self.fetch_one(
+            f"""
+            SELECT MAX(event_at) AS event_at
+            FROM event_time_details
+            {where_sql}
+            """,
+            params,
+        )
+        end_at = latest.get("event_at") if latest else None
+        if end_at is None:
+            return {
+                "range": {
+                    "room_id": room_id,
+                    "live_session_id": live_session_id,
+                    "session": session_row,
+                    "start": None,
+                    "end": None,
+                    "minutes": minutes,
+                    "bucket_minutes": bucket_minutes,
+                },
+                "summary": {"total_events": 0, "unique_users": 0, "by_type": {}, "gift_total_coin": 0},
+                "series": [],
+                "gift_rank": [],
+            }
+
+        start_at = end_at - timedelta(minutes=minutes)
+        range_filters = ["event_at >= %s", "event_at <= %s"]
+        range_params: List[Any] = [start_at, end_at]
+        if live_session_id is not None:
+            range_filters.append("live_session_id = %s")
+            range_params.append(live_session_id)
+        if room_id is not None:
+            range_filters.append("room_id = %s")
+            range_params.append(room_id)
+        range_where_sql = f"WHERE {' AND '.join(range_filters)}"
+        bucket_seconds = max(1, bucket_minutes) * 60
+
+        event_rows = await self.fetch_all(
+            f"""
+            SELECT FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(event_at) / %s) * %s) AS bucket_at,
+                   event_type,
+                   COUNT(*) AS count,
+                   COUNT(DISTINCT NULLIF(uid, 0)) AS unique_users
+            FROM event_time_details
+            {range_where_sql}
+            GROUP BY bucket_at, event_type
+            ORDER BY bucket_at ASC
+            """,
+            (bucket_seconds, bucket_seconds, *range_params),
+        )
+        summary_rows = await self.fetch_all(
+            f"""
+            SELECT event_type,
+                   COUNT(*) AS count,
+                   COUNT(DISTINCT NULLIF(uid, 0)) AS unique_users
+            FROM event_time_details
+            {range_where_sql}
+            GROUP BY event_type
+            """,
+            range_params,
+        )
+        total_row = await self.fetch_one(
+            f"""
+            SELECT COUNT(*) AS total_events,
+                   COUNT(DISTINCT NULLIF(uid, 0)) AS unique_users
+            FROM event_time_details
+            {range_where_sql}
+            """,
+            range_params,
+        )
+        gift_rows = await self.fetch_all(
+            f"""
+            SELECT FROM_UNIXTIME(FLOOR(UNIX_TIMESTAMP(event_at) / %s) * %s) AS bucket_at,
+                   COUNT(*) AS gift_count,
+                   COUNT(DISTINCT NULLIF(uid, 0)) AS gift_users,
+                   COALESCE(SUM(gift_total_price), 0) AS gift_total_coin
+            FROM gift_events
+            {range_where_sql}
+            GROUP BY bucket_at
+            ORDER BY bucket_at ASC
+            """,
+            (bucket_seconds, bucket_seconds, *range_params),
+        )
+        gift_total = await self.fetch_one(
+            f"""
+            SELECT COALESCE(SUM(gift_total_price), 0) AS gift_total_coin
+            FROM gift_events
+            {range_where_sql}
+            """,
+            range_params,
+        )
+        gift_rank = await self.fetch_all(
+            f"""
+            SELECT uid,
+                   MAX(username) AS username,
+                   COUNT(*) AS gift_count,
+                   COALESCE(SUM(gift_num), 0) AS gift_num,
+                   COALESCE(SUM(gift_total_price), 0) AS gift_total_coin,
+                   COUNT(DISTINCT gift_id) AS gift_kinds,
+                   MAX(event_at) AS last_gift_at
+            FROM gift_events
+            {range_where_sql}
+              AND gift_total_price IS NOT NULL
+              AND gift_total_price > 0
+            GROUP BY uid
+            ORDER BY gift_total_coin DESC, gift_count DESC, last_gift_at DESC
+            LIMIT 10
+            """,
+            range_params,
+        )
+
+        series_by_bucket: Dict[datetime, Dict[str, Any]] = {}
+        cursor = start_at.replace(second=0, microsecond=0)
+        cursor = cursor - timedelta(minutes=cursor.minute % bucket_minutes)
+        while cursor <= end_at:
+            series_by_bucket[cursor] = {
+                "bucket": cursor,
+                "label": cursor.strftime("%H:%M"),
+                "danmaku_count": 0,
+                "enter_room_count": 0,
+                "enter_room_users": 0,
+                "follow_count": 0,
+                "follow_users": 0,
+                "gift_count": 0,
+                "gift_users": 0,
+                "gift_total_coin": 0,
+                "guard_count": 0,
+                "super_chat_count": 0,
+            }
+            cursor += timedelta(minutes=bucket_minutes)
+
+        for row in event_rows:
+            bucket_at = row["bucket_at"]
+            if bucket_at not in series_by_bucket:
+                continue
+            event_type = str(row["event_type"])
+            count = int(row["count"] or 0)
+            unique_users = int(row["unique_users"] or 0)
+            if event_type == "danmaku":
+                series_by_bucket[bucket_at]["danmaku_count"] = count
+            elif event_type == "enter_room":
+                series_by_bucket[bucket_at]["enter_room_count"] = count
+                series_by_bucket[bucket_at]["enter_room_users"] = unique_users
+            elif event_type == "follow":
+                series_by_bucket[bucket_at]["follow_count"] = count
+                series_by_bucket[bucket_at]["follow_users"] = unique_users
+            elif event_type == "guard":
+                series_by_bucket[bucket_at]["guard_count"] = count
+            elif event_type == "super_chat":
+                series_by_bucket[bucket_at]["super_chat_count"] = count
+
+        for row in gift_rows:
+            bucket_at = row["bucket_at"]
+            if bucket_at not in series_by_bucket:
+                continue
+            series_by_bucket[bucket_at]["gift_count"] = int(row["gift_count"] or 0)
+            series_by_bucket[bucket_at]["gift_users"] = int(row["gift_users"] or 0)
+            series_by_bucket[bucket_at]["gift_total_coin"] = int(row["gift_total_coin"] or 0)
+
+        summary_by_type = {
+            str(row["event_type"]): {
+                "count": int(row["count"] or 0),
+                "unique_users": int(row["unique_users"] or 0),
+            }
+            for row in summary_rows
+        }
+        series = []
+        for item in series_by_bucket.values():
+            copied = dict(item)
+            copied["bucket"] = item["bucket"].isoformat(timespec="seconds")
+            series.append(copied)
+
+        return {
+            "range": {
+                "room_id": room_id,
+                "live_session_id": live_session_id,
+                "session": session_row,
+                "start": start_at.isoformat(timespec="seconds"),
+                "end": end_at.isoformat(timespec="seconds"),
+                "minutes": minutes,
+                "bucket_minutes": bucket_minutes,
+            },
+            "summary": {
+                "total_events": int((total_row or {}).get("total_events") or 0),
+                "unique_users": int((total_row or {}).get("unique_users") or 0),
+                "by_type": summary_by_type,
+                "gift_total_coin": int((gift_total or {}).get("gift_total_coin") or 0),
+            },
+            "series": series,
+            "gift_rank": [
+                {
+                    "uid": row.get("uid"),
+                    "username": row.get("username") or "",
+                    "gift_count": int(row.get("gift_count") or 0),
+                    "gift_num": int(row.get("gift_num") or 0),
+                    "gift_total_coin": int(row.get("gift_total_coin") or 0),
+                    "gift_kinds": int(row.get("gift_kinds") or 0),
+                    "last_gift_at": row.get("last_gift_at"),
+                }
+                for row in gift_rank
+            ],
+        }
 
     async def create_monitor_run(
         self,

@@ -19,6 +19,7 @@ PROJECTOR_LOCK_NAME = "blivedm_event_projector"
 KNOWN_EVENT_TABLES = {
     "danmaku": "danmaku_events",
     "enter_room": "enter_room_events",
+    "follow": "follow_events",
     "gift": "gift_events",
     "guard": "guard_events",
     "super_chat": "super_chat_events",
@@ -243,6 +244,9 @@ def build_projection_rows(event: Dict[str, Any], context: Dict[str, Any], timezo
     elif event_type == "enter_room":
         fact.update(stats)
         fact.update({"action_text": str(event.get("content") or "进入房间")})
+    elif event_type == "follow":
+        fact.update(stats)
+        fact.update({"action_text": str(event.get("content") or "关注主播")})
     elif event_type == "gift":
         gift_num = maybe_int(first_value(data.get("num"), data.get("gift_num"), data.get("giftNum"))) or 0
         gift_price = maybe_int(first_value(data.get("price"), data.get("gift_price"), data.get("discount_price")))

@@ -12,13 +12,27 @@ const collectorClientRemarkInput = document.querySelector("#collectorClientRemar
 const collectorMaxRoomsInput = document.querySelector("#collectorMaxRoomsInput");
 const collectorEnabledInput = document.querySelector("#collectorEnabledInput");
 const collectorSessdataInput = document.querySelector("#collectorSessdataInput");
+const clientConfigBtn = document.querySelector("#clientConfigBtn");
+const clientConfigCloseBtn = document.querySelector("#clientConfigCloseBtn");
+const clientConfigModal = document.querySelector("#clientConfigModal");
 const refreshBtn = document.querySelector("#refreshBtn");
+const analyticsRefreshBtn = document.querySelector("#analyticsRefreshBtn");
 const eventRoomFilter = document.querySelector("#eventRoomFilter");
 const eventTypeFilter = document.querySelector("#eventTypeFilter");
+const streamSummary = document.querySelector("#streamSummary");
+const analyticsSummary = document.querySelector("#analyticsSummary");
+const analyticsCharts = document.querySelector("#analyticsCharts");
 
 let refreshTimer = null;
 const EVENT_PAGE_SIZE = 50;
 const EVENT_SCROLL_THRESHOLD = 120;
+const ANALYTICS_MINUTES = 60;
+const ANALYTICS_BUCKET_MINUTES = 10;
+const roomSessions = new Map();
+const expandedRooms = new Set();
+let roomsCache = [];
+let selectedRoomId = "";
+let selectedSessionId = "";
 let eventState = {
   items: [],
   hasMore: true,
@@ -30,6 +44,7 @@ let eventState = {
 const EVENT_TYPE_LABELS = {
   danmaku: "弹幕",
   enter_room: "进房",
+  follow: "关注",
   gift: "礼物",
   guard: "上舰",
   super_chat: "醒目留言",
@@ -84,7 +99,19 @@ function formatTime(value) {
   if (!value) return "-";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString();
+  return date.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatDuration(startValue, endValue) {
+  if (!startValue) return "-";
+  const start = new Date(startValue);
+  const end = endValue ? new Date(endValue) : new Date();
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return "-";
+  const seconds = Math.max(0, Math.floor((end.getTime() - start.getTime()) / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (hours) return `${hours}小时${minutes}分`;
+  return `${minutes}分`;
 }
 
 function eventTypeLabel(value) {
@@ -112,6 +139,17 @@ function firstPositiveNumber(...values) {
 
 function formatCompactNumber(value) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
+}
+
+function formatShortNumber(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0";
+  if (number >= 10000) return `${(number / 10000).toFixed(number >= 100000 ? 0 : 1)}万`;
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(number);
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function giftCoinLabel(value) {
@@ -389,9 +427,46 @@ function sessdataCell(client) {
   `;
 }
 
+function renderSessionList(roomNo) {
+  if (!expandedRooms.has(String(roomNo))) return "";
+  const sessions = roomSessions.get(String(roomNo));
+  if (!sessions) {
+    return '<div class="session-list"><div class="session-list-state">场次加载中...</div></div>';
+  }
+  if (!sessions.length) {
+    return '<div class="session-list"><div class="session-list-state">暂无场次记录</div></div>';
+  }
+  return `
+    <div class="session-list">
+      ${sessions
+        .map((session) => {
+          const selected = selectedSessionId === String(session.id);
+          const status = session.status === "live" ? "直播中" : "已结束";
+          return `
+            <button
+              class="session-item${selected ? " selected" : ""}"
+              type="button"
+              data-action="select-session"
+              data-room-filter="${session.room_id}"
+              data-session-id="${session.id}"
+            >
+              <span>
+                <strong>#${escapeHtml(session.id)}</strong>
+                <em>${escapeHtml(status)}</em>
+              </span>
+              <small>${escapeHtml(formatTime(session.started_at))}</small>
+              <small>时长 ${escapeHtml(formatDuration(session.started_at, session.ended_at))}</small>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function renderRooms(rooms) {
   if (!rooms.length) {
-    roomsBody.innerHTML = '<tr><td colspan="7">暂无房间</td></tr>';
+    roomsBody.innerHTML = '<div class="empty-state">暂无房间</div>';
     return;
   }
   const activeRoomFilter = eventRoomFilter.value.trim();
@@ -402,24 +477,32 @@ function renderRooms(rooms) {
       const roomNo = room.real_room_id || room.room_id;
       const enabledText = room.enabled ? "停用" : "启用";
       const selected = activeRoomFilter === String(roomNo);
+      const expanded = expandedRooms.has(String(roomNo));
       return `
-        <tr class="room-row${selected ? " selected" : ""}" data-room-filter="${roomNo}" aria-selected="${selected ? "true" : "false"}">
-          <td>
-            <strong>${roomNo}</strong>
-            <div class="muted">录入 ${room.room_id}</div>
-          </td>
-          <td><div class="room-title" title="${title}">${title}</div></td>
-          <td>${statusBadge(room)}</td>
-          <td>${listeningBadge(room)}</td>
-          <td>${sessionCell(room)}</td>
-          <td>${remark}</td>
-          <td>
-            <div class="actions">
-              <button class="secondary" data-action="toggle" data-id="${room.id}" data-enabled="${room.enabled ? "0" : "1"}">${enabledText}</button>
-              <button class="danger" data-action="delete" data-id="${room.id}">删除</button>
+        <article class="room-card${selected ? " selected" : ""}" data-room-filter="${roomNo}" aria-selected="${selected ? "true" : "false"}">
+          <div class="room-card-main">
+            <div class="room-avatar">${escapeHtml(String(title || roomNo).slice(0, 1).toUpperCase())}</div>
+            <div class="room-card-content">
+              <div class="room-card-title">
+                <strong title="${title}">${title}</strong>
+                ${statusBadge(room)}
+              </div>
+              <div class="room-meta">
+                <span>${roomNo}</span>
+                <span>录入 ${room.room_id}</span>
+                ${listeningBadge(room)}
+              </div>
+              ${room.current_session_id ? `<div class="room-session">${sessionCell(room)}</div>` : ""}
+              <div class="room-remark">${remark || "暂无备注"}</div>
             </div>
-          </td>
-        </tr>
+          </div>
+          <div class="room-actions">
+            <button class="secondary" data-action="toggle-sessions" data-room-filter="${roomNo}">${expanded ? "收起" : "场次"}</button>
+            <button class="secondary" data-action="toggle" data-id="${room.id}" data-enabled="${room.enabled ? "0" : "1"}">${enabledText}</button>
+            <button class="danger" data-action="delete" data-id="${room.id}">删除</button>
+          </div>
+          ${renderSessionList(roomNo)}
+        </article>
       `;
     })
     .join("");
@@ -476,17 +559,57 @@ function renderCollectorClients(clients) {
 
 function updateSelectedRoomRows() {
   const activeRoomFilter = eventRoomFilter.value.trim();
-  roomsBody.querySelectorAll("tr[data-room-filter]").forEach((row) => {
+  selectedRoomId = activeRoomFilter;
+  roomsBody.querySelectorAll(".room-card[data-room-filter]").forEach((row) => {
     const selected = activeRoomFilter && row.dataset.roomFilter === activeRoomFilter;
     row.classList.toggle("selected", Boolean(selected));
     row.setAttribute("aria-selected", selected ? "true" : "false");
   });
+  roomsBody.querySelectorAll(".session-item[data-session-id]").forEach((item) => {
+    item.classList.toggle("selected", selectedSessionId && item.dataset.sessionId === selectedSessionId);
+  });
+}
+
+async function loadRoomSessions(roomNo) {
+  const key = String(roomNo);
+  if (roomSessions.has(key)) return roomSessions.get(key);
+  const payload = await requestJson(`/api/live-sessions?room_id=${encodeURIComponent(key)}&limit=10`);
+  roomSessions.set(key, payload.items || []);
+  return roomSessions.get(key);
 }
 
 async function applyRoomEventFilter(roomNo) {
+  const key = String(roomNo);
+  selectedRoomId = key;
+  selectedSessionId = "";
   eventRoomFilter.value = roomNo;
+  // 选中主播后自动展开场次，并重新拉取以包含刚开播的直播。
+  expandedRooms.add(key);
+  roomSessions.delete(key);
+  renderRooms(roomsCache);
   updateSelectedRoomRows();
-  await loadEvents({ reset: true });
+
+  let sessions = [];
+  try {
+    sessions = await loadRoomSessions(key);
+  } catch (error) {
+    showToast(error.message);
+  }
+  // 默认加载最近一个场次的消息（场次按开播时间倒序，取第一个）。
+  if (sessions.length) {
+    selectedSessionId = String(sessions[0].id);
+  }
+  renderRooms(roomsCache);
+  updateSelectedRoomRows();
+  await Promise.all([loadEvents({ reset: true }), loadAnalytics()]);
+}
+
+async function applySessionEventFilter(roomNo, sessionId) {
+  selectedRoomId = String(roomNo);
+  selectedSessionId = String(sessionId);
+  eventRoomFilter.value = String(roomNo);
+  updateSelectedRoomRows();
+  await Promise.all([loadEvents({ reset: true }), loadAnalytics()]);
 }
 
 function renderEventRows(events) {
@@ -526,8 +649,9 @@ function renderEvents() {
 
 async function loadRooms() {
   const payload = await requestJson("/api/rooms");
-  renderRooms(payload.items);
-  return payload.items;
+  roomsCache = payload.items || [];
+  renderRooms(roomsCache);
+  return roomsCache;
 }
 
 async function loadCollectorClients() {
@@ -541,8 +665,9 @@ function currentEventFilters() {
   const eventType = eventTypeFilter.value;
   return {
     roomId,
+    liveSessionId: selectedSessionId,
     eventType,
-    key: `${roomId}:${eventType}`,
+    key: `${roomId}:${selectedSessionId}:${eventType}`,
   };
 }
 
@@ -553,6 +678,9 @@ function buildEventParams(filters, beforeId) {
   }
   if (filters.eventType) {
     params.set("event_type", filters.eventType);
+  }
+  if (filters.liveSessionId) {
+    params.set("live_session_id", filters.liveSessionId);
   }
   if (beforeId) {
     params.set("before_id", String(beforeId));
@@ -613,6 +741,262 @@ function maybeLoadMoreEvents() {
   loadEvents().catch((error) => showToast(error.message));
 }
 
+const CHART_W = 340;
+const CHART_H = 130;
+const PLOT_LEFT = 30;
+const PLOT_RIGHT = 332;
+const PLOT_TOP = 10;
+const PLOT_BOTTOM = 100;
+const CHART_Y_LEVELS = [1, 2 / 3, 1 / 3, 0];
+
+function chartGeometry(series, keys) {
+  let maxValue = 1;
+  keys.forEach((key) => {
+    series.forEach((item) => {
+      maxValue = Math.max(maxValue, Number(item[key] || 0));
+    });
+  });
+  const plotW = PLOT_RIGHT - PLOT_LEFT;
+  const plotH = PLOT_BOTTOM - PLOT_TOP;
+  return {
+    maxValue,
+    xFor: (index) =>
+      series.length <= 1 ? PLOT_LEFT + plotW / 2 : PLOT_LEFT + (index / (series.length - 1)) * plotW,
+    yFor: (value) => clamp(PLOT_BOTTOM - (value / maxValue) * plotH, PLOT_TOP, PLOT_BOTTOM),
+  };
+}
+
+function seriesPoints(series, key, geo) {
+  return series.map((item, index) => ({
+    x: geo.xFor(index),
+    y: geo.yFor(Number(item[key] || 0)),
+    value: Number(item[key] || 0),
+    label: item.label || "",
+  }));
+}
+
+function pointsToPath(points) {
+  return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+}
+
+function pointsToDots(points, cls) {
+  return points
+    .map(
+      (p) =>
+        `<circle class="chart-dot ${cls}" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="2.6"><title>${escapeHtml(
+          p.label
+        )} · ${escapeHtml(formatShortNumber(p.value))}</title></circle>`
+    )
+    .join("");
+}
+
+function chartGridLines(geo) {
+  return CHART_Y_LEVELS.map((frac) => {
+    const y = geo.yFor(geo.maxValue * frac);
+    return `<line x1="${PLOT_LEFT}" y1="${y.toFixed(1)}" x2="${PLOT_RIGHT}" y2="${y.toFixed(1)}"></line>`;
+  }).join("");
+}
+
+function chartYAxis(geo) {
+  return CHART_Y_LEVELS.map((frac) => {
+    const value = geo.maxValue * frac;
+    const y = geo.yFor(value);
+    return `<text class="axis-y" x="${(PLOT_LEFT - 6).toFixed(1)}" y="${(y + 3).toFixed(1)}" text-anchor="end">${escapeHtml(
+      formatShortNumber(Math.round(value))
+    )}</text>`;
+  }).join("");
+}
+
+function chartXAxis(series, geo) {
+  if (!series.length) return "";
+  const step = Math.max(1, Math.ceil(series.length / 7));
+  return series
+    .map((item, index) => {
+      if (index % step !== 0 && index !== series.length - 1) return "";
+      const anchor = index === 0 ? "start" : index === series.length - 1 ? "end" : "middle";
+      return `<text class="axis-x" x="${geo.xFor(index).toFixed(1)}" y="${(PLOT_BOTTOM + 16).toFixed(
+        1
+      )}" text-anchor="${anchor}">${escapeHtml(item.label || "")}</text>`;
+    })
+    .join("");
+}
+
+function renderChart({ title, subtitle, series, primaryKey, secondaryKey = "", primaryLabel = "", secondaryLabel = "" }) {
+  const keys = secondaryKey ? [primaryKey, secondaryKey] : [primaryKey];
+  const geo = chartGeometry(series, keys);
+  const primaryPoints = seriesPoints(series, primaryKey, geo);
+  const secondaryPoints = secondaryKey ? seriesPoints(series, secondaryKey, geo) : [];
+  return `
+    <article class="chart-card">
+      <div class="chart-head">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p>${escapeHtml(subtitle)}</p>
+        </div>
+        <button class="mini-refresh" type="button" data-action="refresh-analytics">刷新</button>
+      </div>
+      <svg class="line-chart" viewBox="0 0 ${CHART_W} ${CHART_H}" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(title)}趋势图">
+        <g class="grid-lines">${chartGridLines(geo)}</g>
+        <g class="axis-labels">${chartYAxis(geo)}${chartXAxis(series, geo)}</g>
+        ${secondaryPoints.length ? `<path class="chart-line secondary-line" d="${pointsToPath(secondaryPoints)}"></path>` : ""}
+        ${primaryPoints.length ? `<path class="chart-line primary-line" d="${pointsToPath(primaryPoints)}"></path>` : ""}
+        ${secondaryPoints.length ? `<g class="chart-dots">${pointsToDots(secondaryPoints, "secondary")}</g>` : ""}
+        ${primaryPoints.length ? `<g class="chart-dots">${pointsToDots(primaryPoints, "primary")}</g>` : ""}
+      </svg>
+      <div class="chart-legend">
+        <span><i class="legend-dot primary"></i>${escapeHtml(primaryLabel || title)}</span>
+        ${secondaryKey ? `<span><i class="legend-dot secondary"></i>${escapeHtml(secondaryLabel)}</span>` : ""}
+      </div>
+    </article>
+  `;
+}
+
+function renderGiftRank(rows, sessionSelected) {
+  const title = sessionSelected ? "本场次用户送礼榜" : "用户送礼榜";
+  const content = rows.length
+    ? rows
+        .map(
+          (row, index) => `
+            <div class="rank-row">
+              <span class="rank-index">${index + 1}</span>
+              <div class="rank-user">
+                <strong title="${escapeHtml(row.username || row.uid || "-")}">${escapeHtml(row.username || `UID ${row.uid || "-"}`)}</strong>
+                <small>${escapeHtml(row.uid || "-")} · ${escapeHtml(formatTime(row.last_gift_at))}</small>
+              </div>
+              <div class="rank-value">
+                <strong>${escapeHtml(formatShortNumber(row.gift_total_coin))}</strong>
+                <small>${escapeHtml(formatShortNumber(row.gift_count))} 次 / ${escapeHtml(formatShortNumber(row.gift_num))} 件</small>
+              </div>
+            </div>
+          `
+        )
+        .join("")
+    : '<div class="rank-empty">暂无送礼数据</div>';
+  return `
+    <article class="rank-card">
+      <div class="chart-head">
+        <div>
+          <h3>${escapeHtml(title)}</h3>
+          <p>按瓜子总数排序</p>
+        </div>
+      </div>
+      <div class="rank-list">${content}</div>
+    </article>
+  `;
+}
+
+function renderAnalytics(payload) {
+  const summary = payload.summary || {};
+  const byType = summary.by_type || {};
+  const series = payload.series || [];
+  const enterRoom = byType.enter_room || {};
+  const follow = byType.follow || {};
+  const danmaku = byType.danmaku || {};
+  const gift = byType.gift || {};
+  const guard = byType.guard || {};
+  const superChat = byType.super_chat || {};
+  const session = payload.range?.session;
+  const roomText = session
+    ? `房间 ${payload.range.room_id || session.room_id} · 场次 #${session.id}`
+    : payload.range?.room_id
+      ? `房间 ${payload.range.room_id}`
+      : "全部房间";
+
+  streamSummary.textContent = `${roomText} · ${formatShortNumber(summary.total_events)} 条事件 · ${formatShortNumber(summary.unique_users)} 位用户`;
+  analyticsSummary.innerHTML = `
+    <div class="metric-tile">
+      <span>总事件</span>
+      <strong>${formatShortNumber(summary.total_events)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>去重用户</span>
+      <strong>${formatShortNumber(summary.unique_users)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>进房人数</span>
+      <strong>${formatShortNumber(enterRoom.unique_users)}</strong>
+    </div>
+    <div class="metric-tile">
+      <span>礼物价值</span>
+      <strong>${formatShortNumber(summary.gift_total_coin)}</strong>
+    </div>
+  `;
+
+  if (!series.length) {
+    analyticsCharts.innerHTML = '<div class="empty-state">暂无统计数据</div>';
+    return;
+  }
+
+  analyticsCharts.innerHTML = [
+    renderChart({
+      title: "进房间人数",
+      subtitle: `总人次 ${formatShortNumber(enterRoom.count)} / 去重人数 ${formatShortNumber(enterRoom.unique_users)}`,
+      series,
+      primaryKey: "enter_room_count",
+      secondaryKey: "enter_room_users",
+      primaryLabel: "总人次",
+      secondaryLabel: "去重人数",
+    }),
+    renderChart({
+      title: "关注人数",
+      subtitle: `关注总数 ${formatShortNumber(follow.unique_users)}`,
+      series,
+      primaryKey: "follow_count",
+      primaryLabel: "关注人数",
+    }),
+    renderChart({
+      title: "聊天消息",
+      subtitle: `弹幕总数 ${formatShortNumber(danmaku.count)}`,
+      series,
+      primaryKey: "danmaku_count",
+      primaryLabel: "弹幕",
+    }),
+    renderChart({
+      title: "送礼人数",
+      subtitle: `送礼 ${formatShortNumber(gift.count)} 次 / 去重 ${formatShortNumber(gift.unique_users)} 人`,
+      series,
+      primaryKey: "gift_count",
+      secondaryKey: "gift_users",
+      primaryLabel: "送礼次数",
+      secondaryLabel: "送礼人数",
+    }),
+    renderChart({
+      title: "送礼金额",
+      subtitle: `瓜子总数 ${formatShortNumber(summary.gift_total_coin)} · 上舰 ${formatShortNumber(guard.count)} · 醒目 ${formatShortNumber(superChat.count)}`,
+      series,
+      primaryKey: "gift_total_coin",
+      primaryLabel: "瓜子总数",
+    }),
+    renderChart({
+      title: "上舰与醒目留言",
+      subtitle: `上舰 ${formatShortNumber(guard.count)} · 醒目留言 ${formatShortNumber(superChat.count)}`,
+      series,
+      primaryKey: "guard_count",
+      secondaryKey: "super_chat_count",
+      primaryLabel: "上舰",
+      secondaryLabel: "醒目留言",
+    }),
+    renderGiftRank(payload.gift_rank || [], Boolean(session)),
+  ].join("");
+}
+
+async function loadAnalytics() {
+  const filters = currentEventFilters();
+  const params = new URLSearchParams({
+    minutes: String(ANALYTICS_MINUTES),
+    bucket_minutes: String(ANALYTICS_BUCKET_MINUTES),
+  });
+  if (filters.roomId) {
+    params.set("room_id", filters.roomId);
+  }
+  if (filters.liveSessionId) {
+    params.set("live_session_id", filters.liveSessionId);
+  }
+  const payload = await requestJson(`/api/analytics/overview?${params}`);
+  renderAnalytics(payload);
+  return payload;
+}
+
 async function loadStatus() {
   const payload = await requestJson("/api/status");
   const mode = payload.mode === "api-coordinator" ? "API协调服务运行" : "服务运行";
@@ -625,6 +1009,7 @@ async function refreshAll({ resetEvents = true } = {}) {
       loadRooms(),
       loadCollectorClients(),
       resetEvents ? loadEvents({ reset: true }) : Promise.resolve(),
+      loadAnalytics(),
       loadStatus(),
     ]);
   } catch (error) {
@@ -720,10 +1105,45 @@ collectorClientsBody.addEventListener("click", async (event) => {
   }
 });
 
+function openClientConfig() {
+  clientConfigModal.hidden = false;
+  collectorClientIdInput.focus();
+}
+
+function closeClientConfig() {
+  clientConfigModal.hidden = true;
+}
+
+clientConfigBtn.addEventListener("click", openClientConfig);
+clientConfigCloseBtn.addEventListener("click", closeClientConfig);
+clientConfigModal.addEventListener("click", (event) => {
+  if (event.target === clientConfigModal) {
+    closeClientConfig();
+  }
+});
+
 roomsBody.addEventListener("click", async (event) => {
   const target = event.target.closest("button");
   try {
     if (target) {
+      if (target.dataset.action === "toggle-sessions") {
+        const roomNo = target.dataset.roomFilter;
+        const key = String(roomNo);
+        if (expandedRooms.has(key)) {
+          expandedRooms.delete(key);
+        } else {
+          expandedRooms.add(key);
+          renderRooms(roomsCache);
+          await loadRoomSessions(key);
+        }
+        renderRooms(roomsCache);
+        updateSelectedRoomRows();
+        return;
+      }
+      if (target.dataset.action === "select-session") {
+        await applySessionEventFilter(target.dataset.roomFilter, target.dataset.sessionId);
+        return;
+      }
       const id = target.dataset.id;
       if (target.dataset.action === "toggle") {
         await requestJson(`/api/rooms/${id}`, {
@@ -740,7 +1160,7 @@ roomsBody.addEventListener("click", async (event) => {
       return;
     }
 
-    const row = event.target.closest("tr[data-room-filter]");
+    const row = event.target.closest(".room-card[data-room-filter]");
     if (!row) return;
     await applyRoomEventFilter(row.dataset.roomFilter);
   } catch (error) {
@@ -749,15 +1169,21 @@ roomsBody.addEventListener("click", async (event) => {
 });
 
 refreshBtn.addEventListener("click", () => refreshAll({ resetEvents: true }));
+analyticsRefreshBtn.addEventListener("click", () => loadAnalytics().catch((error) => showToast(error.message)));
+analyticsCharts.addEventListener("click", (event) => {
+  if (!event.target.closest("[data-action='refresh-analytics']")) return;
+  loadAnalytics().catch((error) => showToast(error.message));
+});
 eventRoomFilter.addEventListener("input", () => {
+  selectedSessionId = "";
   updateSelectedRoomRows();
   clearTimeout(refreshTimer);
   refreshTimer = setTimeout(() => {
-    loadEvents({ reset: true }).catch((error) => showToast(error.message));
+    Promise.all([loadEvents({ reset: true }), loadAnalytics()]).catch((error) => showToast(error.message));
   }, 250);
 });
 eventTypeFilter.addEventListener("change", () => {
-  loadEvents({ reset: true }).catch((error) => showToast(error.message));
+  Promise.all([loadEvents({ reset: true }), loadAnalytics()]).catch((error) => showToast(error.message));
 });
 eventsList.addEventListener("scroll", maybeLoadMoreEvents);
 
