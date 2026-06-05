@@ -9,11 +9,14 @@ ROOT=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )/.." &>/dev/null && pwd )
 
 pack_and_upload() {
   local dir="$1" pkg="$2" artifact="$3" out="/tmp/$3"
+  # scripts/ 为可选目录（如 api 的运维脚本），存在才打包；client 没有也不报错
+  local extra=()
+  [ -d "$ROOT/$dir/scripts" ] && extra+=(scripts)
   echo "==> 打包 $dir -> $out"
   # COPYFILE_DISABLE + --no-mac-metadata: 不写 macOS xattr，避免服务器解压时的 provenance 告警
   COPYFILE_DISABLE=1 tar --no-mac-metadata -czf "$out" -C "$ROOT/$dir" \
     --exclude='*__pycache__*' --exclude='*.pyc' --exclude='*.pytest_cache*' \
-    "$pkg" pyproject.toml uv.lock README.md run.sh rollback.sh .env.example
+    "$pkg" ${extra[@]+"${extra[@]}"} pyproject.toml uv.lock README.md run.sh rollback.sh .env.example
   echo "==> 上传 oss://$BUCKET/$OSS_PREFIX/$artifact"
   ossutil cp "$out" "oss://$BUCKET/$OSS_PREFIX/$artifact" --loglevel info -f
   echo "==> 完成 $artifact"
