@@ -1015,17 +1015,20 @@ class Database:
         anchor_uid: Optional[int],
         started_at: datetime,
     ) -> Dict[str, Any]:
+        # 直播场次以“房间 + 开播时间(B 站 live_time)”为身份：采集中断重连、或被
+        # 短暂判定下播后恢复，只要还是同一场直播(开播时间不变)就复用同一条场次，
+        # 必要时重新置为直播中，避免一场直播被拆成多条记录。优先匹配相同开播时间，
+        # 其次回退到当前仍打开的场次。
         session = await self.fetch_one(
             """
             SELECT *
             FROM live_sessions
             WHERE room_id = %s
-              AND status = 'live'
-              AND ended_at IS NULL
-            ORDER BY id DESC
+              AND (started_at = %s OR (status = 'live' AND ended_at IS NULL))
+            ORDER BY (started_at = %s) DESC, id DESC
             LIMIT 1
             """,
-            (real_room_id,),
+            (real_room_id, started_at, started_at),
         )
         if session is None:
             if self._pool is None:
@@ -1052,6 +1055,8 @@ class Database:
                     room_title = %s,
                     started_at = %s,
                     status = 'live',
+                    ended_at = NULL,
+                    detected_ended_at = NULL,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
                 """,
