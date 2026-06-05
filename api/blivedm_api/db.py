@@ -453,6 +453,13 @@ class Database:
         await self.ensure_column("collector_clients", "enabled", "TINYINT(1) NOT NULL DEFAULT 1 AFTER bili_sessdata")
         await self.ensure_column("collector_clients", "max_active_rooms", "INT NOT NULL DEFAULT 50 AFTER enabled")
         await self.ensure_column("rooms", "current_session_id", "BIGINT NULL AFTER live_status")
+        # 主播/房间额外信息（均来自 get_info，无需额外请求）
+        await self.ensure_column("rooms", "fans_count", "BIGINT NOT NULL DEFAULT 0 AFTER anchor_uid")
+        await self.ensure_column("rooms", "online_count", "BIGINT NOT NULL DEFAULT 0 AFTER fans_count")
+        await self.ensure_column("rooms", "area_name", "VARCHAR(64) NOT NULL DEFAULT '' AFTER online_count")
+        await self.ensure_column("rooms", "parent_area_name", "VARCHAR(64) NOT NULL DEFAULT '' AFTER area_name")
+        await self.ensure_column("rooms", "description", "VARCHAR(512) NOT NULL DEFAULT '' AFTER parent_area_name")
+        await self.ensure_column("rooms", "cover_url", "VARCHAR(512) NOT NULL DEFAULT '' AFTER description")
         await self.ensure_column("room_events", "live_session_id", "BIGINT NULL AFTER event_key")
         await self.ensure_index("room_events", "idx_room_events_session_created", "KEY idx_room_events_session_created (live_session_id, created_at)")
         await self.ensure_index("room_events", "idx_room_events_room_id", "KEY idx_room_events_room_id (room_id, id)")
@@ -987,6 +994,12 @@ class Database:
         anchor_uid: Optional[int],
         live_status: int,
         live_started_at: Optional[datetime] = None,
+        fans_count: int = 0,
+        online_count: int = 0,
+        area_name: str = "",
+        parent_area_name: str = "",
+        description: str = "",
+        cover_url: str = "",
     ) -> None:
         await self.execute(
             """
@@ -995,6 +1008,12 @@ class Database:
                 room_title = %s,
                 anchor_uid = %s,
                 live_status = %s,
+                fans_count = %s,
+                online_count = %s,
+                area_name = %s,
+                parent_area_name = %s,
+                description = %s,
+                cover_url = %s,
                 last_live_at = CASE
                     WHEN %s = 1 THEN COALESCE(%s, last_live_at, CURRENT_TIMESTAMP)
                     ELSE last_live_at
@@ -1003,7 +1022,11 @@ class Database:
                 updated_at = CURRENT_TIMESTAMP
             WHERE room_id = %s
             """,
-            (real_room_id, room_title, anchor_uid, live_status, live_status, live_started_at, room_id),
+            (
+                real_room_id, room_title, anchor_uid, live_status,
+                fans_count, online_count, area_name, parent_area_name, description, cover_url,
+                live_status, live_started_at, room_id,
+            ),
         )
 
     async def ensure_live_session(

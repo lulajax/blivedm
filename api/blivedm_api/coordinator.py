@@ -118,6 +118,12 @@ class RoomCoordinator:
                     anchor_uid=info.anchor_uid,
                     live_status=info.live_status,
                     live_started_at=info.live_time,
+                    fans_count=info.fans_count,
+                    online_count=info.online_count,
+                    area_name=info.area_name,
+                    parent_area_name=info.parent_area_name,
+                    description=info.description,
+                    cover_url=info.cover_url,
                 )
                 if info.live_status != 1:
                     await self._db.finish_live_session(

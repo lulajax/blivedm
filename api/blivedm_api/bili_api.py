@@ -23,6 +23,13 @@ class BiliRoomInfo:
     anchor_uid: Optional[int]
     live_status: int
     live_time: Optional[datetime]
+    # 以下都来自 get_info 的免费字段，无需额外请求
+    fans_count: int = 0
+    online_count: int = 0
+    area_name: str = ""
+    parent_area_name: str = ""
+    description: str = ""
+    cover_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,12 @@ async def fetch_room_info(session: aiohttp.ClientSession, room_id: int) -> BiliR
         anchor_uid=int(data["uid"]) if data.get("uid") is not None else None,
         live_status=int(data.get("live_status") or 0),
         live_time=parse_bili_live_time(data.get("live_time")),
+        fans_count=int(data.get("attention") or 0),
+        online_count=int(data.get("online") or 0),
+        area_name=str(data.get("area_name") or ""),
+        parent_area_name=str(data.get("parent_area_name") or ""),
+        description=str(data.get("description") or ""),
+        cover_url=str(data.get("user_cover") or data.get("keyframe") or ""),
     )
 
 

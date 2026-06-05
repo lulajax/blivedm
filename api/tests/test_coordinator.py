@@ -30,6 +30,12 @@ class FakeRoomInfo:
     anchor_uid: int
     live_status: int
     live_time: datetime
+    fans_count: int = 0
+    online_count: int = 0
+    area_name: str = ""
+    parent_area_name: str = ""
+    description: str = ""
+    cover_url: str = ""
 
 
 @dataclass
