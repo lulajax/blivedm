@@ -9,3 +9,8 @@ output/
 dist/
 build/
 *.egg-info/
+api/.env.prod
+logs/
+pids/
+*.tar.gz
+*.tar.gz.prev
